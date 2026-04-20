@@ -99,6 +99,6 @@ echo "Wrapper points to:"
 echo "  $PLUGIN_DIST_ENTRY"
 echo
 echo "Next steps:"
-echo "  1. Ensure the gateway is running at http://localhost:3001 or set FORMSY_GATEWAY_URL."
+echo "  1. Ensure the gateway is running at http://localhost:3001/v1/gateway/patch or set FORMSY_GATEWAY_URL."
 echo "  2. Start OpenCode from that project: opencode"
 echo "  3. Ask OpenCode to call the formsy_generate_patch tool."

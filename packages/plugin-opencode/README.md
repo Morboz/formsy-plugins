@@ -8,8 +8,8 @@ This package adds one OpenCode custom tool, `formsy_generate_patch`, that forwar
 
 The tool is a thin wrapper around:
 
-- `POST http://localhost:3001/patch` by default
-- or `POST $FORMSY_GATEWAY_URL/patch` if you override the gateway URL
+- `POST http://localhost:3001/v1/gateway/patch` by default
+- or `POST $FORMSY_GATEWAY_URL/v1/gateway/patch` if you override the gateway URL
 
 ## Installation
 

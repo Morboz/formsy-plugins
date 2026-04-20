@@ -17,17 +17,20 @@ export interface GeneratePatchResult {
   data: unknown;
 }
 
+const DEFAULT_GATEWAY_URL = 'http://localhost:3001';
+const PATCH_PATH = '/v1/gateway/patch';
+
 export class OpenCodeRuntime {
   private gatewayUrl: string;
 
   constructor() {
-    this.gatewayUrl = process.env.FORMSY_GATEWAY_URL || 'http://localhost:3001';
+    this.gatewayUrl = process.env.FORMSY_GATEWAY_URL || DEFAULT_GATEWAY_URL;
   }
 
   async generatePatch(
     options: GeneratePatchOptions
   ): Promise<GeneratePatchResult> {
-    const upstreamUrl = new URL('/patch', this.gatewayUrl).toString();
+    const upstreamUrl = new URL(PATCH_PATH, this.gatewayUrl).toString();
 
     let response: Response;
     try {
@@ -62,7 +65,7 @@ export class OpenCodeRuntime {
         typeof data.error.message === 'string'
           ? data.error.message
           : `Patch gateway returned status ${response.status}`;
-      throw new Error(message);
+      throw new Error(`${message} (${upstreamUrl})`);
     }
 
     return {

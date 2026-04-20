@@ -12,6 +12,7 @@ export const FormsyOpenCodePlugin: Plugin = async ({ directory, client }) => {
       extra: {
         directory,
         gatewayUrl: process.env.FORMSY_GATEWAY_URL || 'http://localhost:3001',
+        patchPath: '/v1/gateway/patch',
       },
     },
   });
