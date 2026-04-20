@@ -1,0 +1,13 @@
+# Example Formsy configuration file
+# Place this in your project root as .formsy.json
+
+{
+  "apiKey": "your-api-key-here",
+  "projectId": "your-project-id",
+  "enabled": true,
+  "mode": "auto-augment",
+  "injectionMode": "augment",
+  "retentionPolicy": "standard",
+  "showUploads": true,
+  "maxContextTokens": 12000
+}

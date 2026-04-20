@@ -1,0 +1,8 @@
+{
+  "recommendations": [
+    {
+      "extensionId": "ms-vscode.vscode-typescript-next",
+      "reason": "TypeScript language support"
+    }
+  ]
+}
