@@ -1,5 +1,5 @@
 {
-  "name": "@formsy/plugin-core",
+  "name": "@formsy/plugin-opencode",
   "version": "0.1.0",
   "type": "module",
   "main": "./dist/index.js",
@@ -16,8 +16,7 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@formsy/sdk-core": "workspace:*",
-    "glob": "^10.4.5"
+    "@opencode-ai/plugin": "^1.14.19"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

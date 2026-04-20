@@ -1,10 +1,10 @@
 import {
   PKCEFlow,
-  CallbackServer,
   buildAuthorizationURL,
   exchangeCodeForTokens,
   refreshAccessToken,
 } from './pkce.js';
+import { CallbackServer } from './callback-server.js';
 import { TokenStorage, StoredTokens } from './token-storage.js';
 
 const FORMSY_CLIENT_ID = 'formsy-cli';
@@ -35,11 +35,9 @@ export interface UserInfo {
  * Handles login, logout, token refresh, and user info
  */
 export class AuthManager {
-  private storage: TokenStorage;
   private baseURL: string;
 
   constructor(config: AuthConfig) {
-    this.storage = new TokenStorage();
     this.baseURL = config.baseURL;
   }
 
@@ -49,10 +47,7 @@ export class AuthManager {
    */
   async login(): Promise<UserInfo> {
     const pkce = new PKCEFlow();
-    const callbackServer = new CallbackServer({
-      port: CALLBACK_PORT,
-      timeout: 5 * 60 * 1000, // 5 minute timeout
-    });
+    const callbackServer = new CallbackServer(CALLBACK_PORT);
 
     // Build authorization URL
     const authURL = buildAuthorizationURL({
@@ -70,7 +65,10 @@ export class AuthManager {
     await this.openBrowser(authURL);
 
     // Wait for callback
-    const { code } = await callbackServer.waitForCallback(pkce.getState());
+    const { code } = await callbackServer.waitForCallback(
+      pkce.getState(),
+      5 * 60 * 1000
+    );
 
     // Exchange code for tokens
     const tokenResponse = await exchangeCodeForTokens({
@@ -85,11 +83,10 @@ export class AuthManager {
     const tokens: StoredTokens = {
       access_token: tokenResponse.access_token,
       refresh_token: tokenResponse.refresh_token,
-      token_type: tokenResponse.token_type,
       expires_at: Date.now() + tokenResponse.expires_in * 1000,
       scope: tokenResponse.scope,
     };
-    await this.storage.store(tokens);
+    await TokenStorage.store(tokens);
 
     // Fetch and return user info
     return await this.fetchUserInfo(tokens.access_token);
@@ -99,7 +96,7 @@ export class AuthManager {
    * Logout - revoke tokens and clear storage
    */
   async logout(): Promise<void> {
-    const tokens = await this.storage.retrieve();
+    const tokens = await TokenStorage.retrieve();
 
     if (tokens) {
       // Revoke refresh token on server
@@ -117,18 +114,18 @@ export class AuthManager {
       }
     }
 
-    await this.storage.delete();
+    await TokenStorage.delete();
   }
 
   /**
    * Get a valid access token, refreshing if necessary
    */
   async getAccessToken(): Promise<string | null> {
-    const tokens = await this.storage.retrieve();
+    const tokens = await TokenStorage.retrieve();
     if (!tokens) return null;
 
     // Refresh if expired or expiring soon
-    if (this.storage.willExpireSoon(tokens)) {
+    if (this.willExpireSoon(tokens)) {
       try {
         const refreshed = await refreshAccessToken({
           tokenEndpoint: `${this.baseURL}/oauth/token`,
@@ -139,15 +136,14 @@ export class AuthManager {
         const newTokens: StoredTokens = {
           access_token: refreshed.access_token,
           refresh_token: refreshed.refresh_token,
-          token_type: refreshed.token_type,
           expires_at: Date.now() + refreshed.expires_in * 1000,
           scope: refreshed.scope,
         };
-        await this.storage.store(newTokens);
+        await TokenStorage.store(newTokens);
         return newTokens.access_token;
       } catch (error) {
         // Refresh failed - user needs to login again
-        await this.storage.delete();
+        await TokenStorage.delete();
         return null;
       }
     }
@@ -185,6 +181,10 @@ export class AuthManager {
     }
 
     return await response.json();
+  }
+
+  private willExpireSoon(tokens: StoredTokens): boolean {
+    return tokens.expires_at - Date.now() < 5 * 60 * 1000;
   }
 
   /**

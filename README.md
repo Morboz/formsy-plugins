@@ -21,6 +21,7 @@ This monorepo follows the design principles outlined in `coding-context-cloud-ar
 ### Plugins
 
 - **`@formsy/plugin-claude-code`** - Claude Code integration plugin
+- **`@formsy/plugin-opencode`** - OpenCode native plugin with a custom context compilation tool
 
 ## Getting Started
 
@@ -142,7 +143,8 @@ formsy-plugin/
 ├── packages/
 │   ├── sdk-core/           # Core SDK and types
 │   ├── plugin-core/        # Shared plugin utilities
-│   └── plugin-claude-code/ # Claude Code plugin
+│   ├── plugin-claude-code/ # Claude Code plugin
+│   └── plugin-opencode/    # OpenCode plugin
 ├── package.json           # Root package.json
 ├── turbo.json            # Turborepo config
 └── tsconfig.json         # Base TypeScript config
