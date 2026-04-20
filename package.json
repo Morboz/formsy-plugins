@@ -11,6 +11,7 @@
     "dev": "turbo run dev",
     "lint": "turbo run lint",
     "test": "turbo run test",
+    "test:opencode-plugin": "node ./scripts/test-opencode-plugin.mjs",
     "clean": "turbo run clean && rm -rf node_modules"
   },
   "devDependencies": {

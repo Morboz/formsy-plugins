@@ -1,18 +1,23 @@
 import { tool, type Plugin } from '@opencode-ai/plugin';
 import { OpenCodeRuntime } from './runtime.js';
 
+const PLUGIN_MARKER = 'formsy-opencode-plugin@patch-v2';
+
 export const FormsyOpenCodePlugin: Plugin = async ({ directory, client }) => {
   const runtime = new OpenCodeRuntime();
+
+  console.log(`[${PLUGIN_MARKER}] initialized for directory=${directory}`);
 
   await client.app.log({
     body: {
       service: 'formsy-opencode-plugin',
       level: 'info',
-      message: 'Initialized Formsy OpenCode plugin',
+      message: `Initialized ${PLUGIN_MARKER}`,
       extra: {
         directory,
         gatewayUrl: process.env.FORMSY_GATEWAY_URL || 'http://localhost:3001',
         patchPath: '/v1/gateway/patch',
+        marker: PLUGIN_MARKER,
       },
     },
   });
@@ -38,6 +43,20 @@ export const FormsyOpenCodePlugin: Plugin = async ({ directory, client }) => {
             throw new Error('case_id is required');
           }
 
+          console.log(`[${PLUGIN_MARKER}] formsy_generate_patch case_id=${args.case_id}`);
+
+          await client.app.log({
+            body: {
+              service: 'formsy-opencode-plugin',
+              level: 'info',
+              message: `${PLUGIN_MARKER} executing formsy_generate_patch`,
+              extra: {
+                case_id: args.case_id,
+                type: args.type,
+              },
+            },
+          });
+
           const result = await runtime.generatePatch({
             type: args.type,
             case_id: args.case_id,
@@ -46,14 +65,13 @@ export const FormsyOpenCodePlugin: Plugin = async ({ directory, client }) => {
             budget: args.budget,
           });
 
-          return {
-            output: JSON.stringify(result.data, null, 2),
-            metadata: {
-              upstreamUrl: result.upstreamUrl,
-              status: result.status,
-              response: result.data,
-            },
-          };
+          return [
+            `[${PLUGIN_MARKER}]`,
+            `upstreamUrl: ${result.upstreamUrl}`,
+            `status: ${result.status}`,
+            '',
+            JSON.stringify(result.data, null, 2),
+          ].join('\n');
         },
       }),
     },
