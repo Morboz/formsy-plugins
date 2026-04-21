@@ -111,19 +111,16 @@ export const FormsyOpenCodePlugin: Plugin = async ({ directory, client }) => {
             },
           });
 
-          return JSON.stringify(
-            {
-              marker: PLUGIN_MARKER,
-              upstreamUrl: result.upstreamUrl,
-              status: result.status,
-              repoId: result.repoId,
-              revision: result.revision,
-              query: args.query,
-              data: result.data,
-            },
-            null,
-            2
-          );
+          if (
+            typeof result.data === 'object' &&
+            result.data !== null &&
+            'extra_context' in result.data &&
+            typeof result.data.extra_context === 'string'
+          ) {
+            return result.data.extra_context;
+          }
+
+          return JSON.stringify(result.data, null, 2);
         },
       }),
     },
