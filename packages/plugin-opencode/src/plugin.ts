@@ -1,7 +1,7 @@
 import { tool, type Plugin } from '@opencode-ai/plugin';
 import { OpenCodeRuntime } from './runtime.js';
 
-const PLUGIN_MARKER = 'formsy-opencode-plugin@patch-v2';
+const PLUGIN_MARKER = 'formsy-opencode-plugin@compile-query-v1';
 
 export const FormsyOpenCodePlugin: Plugin = async ({ directory, client }) => {
   const runtime = new OpenCodeRuntime();
@@ -16,7 +16,8 @@ export const FormsyOpenCodePlugin: Plugin = async ({ directory, client }) => {
       extra: {
         directory,
         gatewayUrl: process.env.FORMSY_GATEWAY_URL || 'http://localhost:3001',
-        patchPath: '/v1/gateway/patch',
+        compilePath: '/v1/gateway/compile',
+        queryPath: '/v1/gateway/query',
         marker: PLUGIN_MARKER,
       },
     },
@@ -24,54 +25,105 @@ export const FormsyOpenCodePlugin: Plugin = async ({ directory, client }) => {
 
   return {
     tool: {
-      formsy_generate_patch: tool({
-        description: 'Generate a SWE-bench patch via the Formsy gateway /patch endpoint',
+      formsy_compile_repo: tool({
+        description:
+          'Scan the current repository source files, skip tests, and compile each file via the Formsy gateway /compile endpoint',
         args: {
-          type: tool.schema.literal('swebench'),
-          case_id: tool.schema.string(),
-          stop_after: tool.schema.string().optional(),
+          repo_id: tool.schema.string().optional(),
+          revision: tool.schema.string().optional(),
           enable_w2: tool.schema.boolean().optional(),
-          budget: tool.schema
-            .object({
-              max_tokens: tool.schema.number().int().optional(),
-              max_time_seconds: tool.schema.number().int().optional(),
-            })
-            .optional(),
+          include: tool.schema.array(tool.schema.string()).optional(),
         },
-        async execute(args) {
-          if (!args.case_id.trim()) {
-            throw new Error('case_id is required');
-          }
-
-          console.log(`[${PLUGIN_MARKER}] formsy_generate_patch case_id=${args.case_id}`);
+        async execute(args, context) {
+          const result = await runtime.compileRepository({
+            directory: context.directory,
+            repo_id: args.repo_id,
+            revision: args.revision,
+            enable_w2: args.enable_w2,
+            include: args.include,
+          });
 
           await client.app.log({
             body: {
               service: 'formsy-opencode-plugin',
               level: 'info',
-              message: `${PLUGIN_MARKER} executing formsy_generate_patch`,
+              message: `${PLUGIN_MARKER} executing formsy_compile_repo`,
               extra: {
-                case_id: args.case_id,
-                type: args.type,
+                repo_id: result.repoId,
+                revision: result.revision,
+                compiledFiles: result.compiledFiles.length,
+                failures: result.failures.length,
               },
             },
           });
 
-          const result = await runtime.generatePatch({
-            type: args.type,
-            case_id: args.case_id,
-            stop_after: args.stop_after,
-            enable_w2: args.enable_w2,
+          return JSON.stringify(
+            {
+              marker: PLUGIN_MARKER,
+              upstreamUrl: result.upstreamUrl,
+              status: result.status,
+              repoId: result.repoId,
+              revision: result.revision,
+              compiledFiles: result.compiledFiles,
+              skippedFiles: result.skippedFiles,
+              failures: result.failures,
+              data: result.data,
+            },
+            null,
+            2
+          );
+        },
+      }),
+      formsy_query_context: tool({
+        description:
+          'Query the repository semantic index via the Formsy gateway /query endpoint for task-relevant context',
+        args: {
+          query: tool.schema.string(),
+          repo_id: tool.schema.string().optional(),
+          revision: tool.schema.string().optional(),
+          budget: tool.schema.number().int().positive().optional(),
+          metadata: tool.schema.record(tool.schema.string(), tool.schema.any()).optional(),
+        },
+        async execute(args, context) {
+          if (!args.query.trim()) {
+            throw new Error('query is required');
+          }
+
+          const result = await runtime.queryRepository({
+            directory: context.directory,
+            query: args.query,
+            repo_id: args.repo_id,
+            revision: args.revision,
             budget: args.budget,
+            metadata: args.metadata,
           });
 
-          return [
-            `[${PLUGIN_MARKER}]`,
-            `upstreamUrl: ${result.upstreamUrl}`,
-            `status: ${result.status}`,
-            '',
-            JSON.stringify(result.data, null, 2),
-          ].join('\n');
+          await client.app.log({
+            body: {
+              service: 'formsy-opencode-plugin',
+              level: 'info',
+              message: `${PLUGIN_MARKER} executing formsy_query_context`,
+              extra: {
+                repo_id: result.repoId,
+                revision: result.revision,
+                budget: args.budget,
+              },
+            },
+          });
+
+          return JSON.stringify(
+            {
+              marker: PLUGIN_MARKER,
+              upstreamUrl: result.upstreamUrl,
+              status: result.status,
+              repoId: result.repoId,
+              revision: result.revision,
+              query: args.query,
+              data: result.data,
+            },
+            null,
+            2
+          );
         },
       }),
     },

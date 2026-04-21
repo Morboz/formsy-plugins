@@ -4,12 +4,16 @@ Formsy native plugin for OpenCode.
 
 ## What It Does
 
-This package adds one OpenCode custom tool, `formsy_generate_patch`, that forwards a request to the gateway service `/patch` endpoint.
+This package adds two OpenCode custom tools:
 
-The tool is a thin wrapper around:
+- `formsy_compile_repo` scans the current repository, skips test files, and forwards one file at a time to the gateway `/compile` endpoint
+- `formsy_query_context` sends a natural-language task query to the gateway `/query` endpoint to retrieve repository context
 
-- `POST http://localhost:3001/v1/gateway/patch` by default
-- or `POST $FORMSY_GATEWAY_URL/v1/gateway/patch` if you override the gateway URL
+The tools are thin wrappers around:
+
+- `POST http://localhost:3001/v1/gateway/compile` by default
+- `POST http://localhost:3001/v1/gateway/query` by default
+- or the same paths under `$FORMSY_GATEWAY_URL` if you override the gateway URL
 
 ## Installation
 
@@ -44,33 +48,52 @@ For an npm-installed plugin, add it to `opencode.json`:
 
 For local testing, you can also copy the built plugin into `.opencode/plugins/` and export `FormsyOpenCodePlugin`.
 
-## Tool
+## Tools
 
-### `formsy_generate_patch`
+### `formsy_compile_repo`
 
 Arguments:
 
-- `type` required literal `swebench`
-- `case_id` required string
-- `stop_after` optional string
+- `repo_id` optional string override
+- `revision` optional string override
 - `enable_w2` optional boolean
-- `budget` optional object
-  - `max_tokens` optional integer
-  - `max_time_seconds` optional integer
+- `include` optional string array for path substring filtering
+
+Defaults:
+
+- `repo_id` prefers `git remote.origin.url`, then falls back to the local repo name
+- `revision` prefers `git rev-parse HEAD`
+- source scanning skips test files and common directories such as `node_modules`, `dist`, `build`, `.git`
 
 Returns:
 
-- response body from the gateway `/patch` endpoint
-- metadata with `upstreamUrl`, `status`, and raw response
+- compile summary including `repoId`, `revision`, compiled file paths, skipped file paths, failures, and raw upstream response
 
 Example usage inside OpenCode:
 
 ```txt
-Use the formsy_generate_patch tool with:
-type: "swebench"
-case_id: "django__django-14999"
+Use the formsy_compile_repo tool with:
 enable_w2: true
-budget:
-  max_tokens: 20000
-  max_time_seconds: 900
+```
+
+### `formsy_query_context`
+
+Arguments:
+
+- `query` required string
+- `repo_id` optional string override
+- `revision` optional string override
+- `budget` optional positive integer
+- `metadata` optional object
+
+Returns:
+
+- query metadata plus the raw upstream `/query` response
+
+Example usage inside OpenCode:
+
+```txt
+Use the formsy_query_context tool with:
+query: "Find the modules responsible for authentication and request routing"
+budget: 4000
 ```
