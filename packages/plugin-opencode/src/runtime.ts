@@ -6,8 +6,9 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 
 const DEFAULT_GATEWAY_URL = 'http://localhost:3001';
-const COMPILE_PATH = '/v1/gateway/compile';
-const QUERY_PATH = '/v1/gateway/query';
+const COMPILE_PATH = '/api/v1/compile';
+const SEARCH_PATH = '/api/v1/query';
+const READ_PATH = '/api/v1/read';
 
 const IGNORED_DIRECTORIES = new Set([
   '.cache',
@@ -37,6 +38,11 @@ const SOURCE_EXTENSIONS = new Set([
 ]);
 
 const TEST_SEGMENTS = new Set(['__tests__', 'spec', 'specs', 'test', 'tests']);
+const REMOTE_REPO_PATTERNS = [
+  /github\.com[:/](?<owner>[^/]+)\/(?<repo>[^/.]+)(?:\.git)?$/i,
+  /gitlab\.com[:/](?<owner>[^/]+)\/(?<repo>[^/.]+)(?:\.git)?$/i,
+  /bitbucket\.org[:/](?<owner>[^/]+)\/(?<repo>[^/.]+)(?:\.git)?$/i,
+];
 
 export interface CompileRepositoryOptions {
   directory: string;
@@ -53,6 +59,30 @@ export interface QueryRepositoryOptions {
   revision?: string;
   budget?: number;
   metadata?: Record<string, unknown>;
+}
+
+export interface ContextSearchOptions {
+  directory: string;
+  query: string;
+  repo_id?: string;
+  revision?: string;
+  session_id?: string;
+  budget?: number;
+  enable_profiling?: boolean;
+  profiling_top_n?: number;
+  metadata?: Record<string, unknown>;
+  identity?: Record<string, unknown>;
+}
+
+export interface ContextReadOptions {
+  directory: string;
+  path: string;
+  repo_id?: string;
+  revision?: string;
+  session_id?: string;
+  start_line?: number;
+  end_line?: number;
+  identity?: Record<string, unknown>;
 }
 
 export interface GatewayResult {
@@ -75,6 +105,54 @@ export interface CompileRepositoryResult extends GatewayResult {
   failures: Array<{ path: string; error: string }>;
 }
 
+export interface ContextToolResult {
+  output: string;
+  metadata: Record<string, unknown>;
+}
+
+export function normalizeRepoId(
+  remoteUrl: string | undefined,
+  rootDirectory: string,
+  directory: string
+): string {
+  const trimmed = remoteUrl?.trim();
+  if (trimmed) {
+    for (const pattern of REMOTE_REPO_PATTERNS) {
+      const match = trimmed.match(pattern);
+      const owner = match?.groups?.owner;
+      const repo = match?.groups?.repo;
+      if (owner && repo) {
+        return `${owner}__${repo.replace(/\.git$/, '')}`;
+      }
+    }
+
+    try {
+      const url = new URL(trimmed);
+      const parts = url.pathname.split('/').filter(Boolean);
+      if (parts.length >= 2) {
+        const owner = parts[parts.length - 2];
+        const repo = parts[parts.length - 1].replace(/\.git$/, '');
+        if (owner && repo) {
+          return `${owner}__${repo}`;
+        }
+      }
+    } catch {
+      const parts = trimmed.split(/[:/]/).filter(Boolean);
+      if (parts.length >= 2) {
+        const owner = parts[parts.length - 2];
+        const repo = parts[parts.length - 1].replace(/\.git$/, '');
+        if (owner && repo) {
+          return `${owner}__${repo}`;
+        }
+      }
+    }
+
+    return trimmed.replace(/\.git$/, '');
+  }
+
+  return path.basename(rootDirectory) || path.basename(directory) || directory;
+}
+
 interface SourceFile {
   absolutePath: string;
   relativePath: string;
@@ -83,7 +161,10 @@ interface SourceFile {
 interface CompileRequestBody {
   repo_id: string;
   revision?: string;
+  mode: 'replace';
+  removed_paths: string[];
   enable_w2?: boolean;
+  metadata: Record<string, unknown>;
   files: Array<{
     path: string;
     content: string;
@@ -96,7 +177,10 @@ export class OpenCodeRuntime {
   private gatewayUrl: string;
 
   constructor() {
-    this.gatewayUrl = process.env.FORMSY_GATEWAY_URL || DEFAULT_GATEWAY_URL;
+    this.gatewayUrl =
+      process.env.FORMSY_GATEWAY_URL ||
+      process.env.FORMSY_BASE_URL ||
+      DEFAULT_GATEWAY_URL;
   }
 
   async resolveRepositoryContext(
@@ -109,11 +193,7 @@ export class OpenCodeRuntime {
       ['config', '--get', 'remote.origin.url'],
       rootDirectory
     );
-    const repoId =
-      overrides.repo_id ||
-      remoteUrl ||
-      path.basename(rootDirectory) ||
-      path.basename(directory);
+    const repoId = overrides.repo_id || normalizeRepoId(remoteUrl, rootDirectory, directory);
     const revision =
       overrides.revision || (await this.runGit(['rev-parse', 'HEAD'], rootDirectory)) || undefined;
 
@@ -133,28 +213,18 @@ export class OpenCodeRuntime {
     const skippedFiles: string[] = [];
     const failures: Array<{ path: string; error: string }> = [];
     const upstreamUrl = new URL(COMPILE_PATH, this.gatewayUrl).toString();
-    let lastData: unknown = { ok: true };
-    let lastStatus = 200;
+    const files: CompileRequestBody['files'] = [];
 
     for (const file of sourceFiles) {
       try {
         const content = await readFile(file.absolutePath, 'utf8');
-        const result = await this.postJson<CompileRequestBody>(COMPILE_PATH, {
-          repo_id: context.repoId,
-          revision: context.revision,
-          enable_w2: options.enable_w2,
-          files: [
-            {
-              path: file.relativePath,
-              content,
-              language: this.detectLanguage(file.relativePath),
-              is_test: false,
-            },
-          ],
+        files.push({
+          path: file.relativePath,
+          content,
+          language: this.detectLanguage(file.relativePath),
+          is_test: false,
         });
         compiledFiles.push(file.relativePath);
-        lastData = result.data;
-        lastStatus = result.status;
       } catch (error) {
         skippedFiles.push(file.relativePath);
         failures.push({
@@ -164,10 +234,26 @@ export class OpenCodeRuntime {
       }
     }
 
+    const result = files.length > 0
+      ? await this.postJson<CompileRequestBody>(COMPILE_PATH, {
+          repo_id: context.repoId,
+          revision: context.revision,
+          mode: 'replace',
+          removed_paths: [],
+          enable_w2: options.enable_w2,
+          metadata: {},
+          files,
+        })
+      : {
+          status: 200,
+          upstreamUrl,
+          data: { ok: true, skipped: 'no source files matched' },
+        };
+
     return {
-      status: lastStatus,
+      status: result.status,
       upstreamUrl,
-      data: lastData,
+      data: result.data,
       repoId: context.repoId,
       revision: context.revision,
       compiledFiles,
@@ -180,7 +266,7 @@ export class OpenCodeRuntime {
     options: QueryRepositoryOptions
   ): Promise<GatewayResult & { repoId: string; revision?: string }> {
     const context = await this.resolveRepositoryContext(options.directory, options);
-    const result = await this.postJson(QUERY_PATH, {
+    const result = await this.postJson(SEARCH_PATH, {
       repo_id: context.repoId,
       query: options.query,
       revision: context.revision,
@@ -192,6 +278,79 @@ export class OpenCodeRuntime {
       ...result,
       repoId: context.repoId,
       revision: context.revision,
+    };
+  }
+
+  async contextSearch(options: ContextSearchOptions): Promise<ContextToolResult> {
+    const query = options.query.trim();
+    if (!query) {
+      throw new Error('query is required');
+    }
+
+    const context = await this.resolveRepositoryContext(options.directory, options);
+    const result = await this.postJson(
+      this.memorySearchEndpoint(),
+      {
+        repo_id: context.repoId,
+        query,
+        revision: context.revision || 'latest',
+        budget: options.budget ?? 4000,
+        enable_profiling: options.enable_profiling ?? false,
+        profiling_top_n: options.profiling_top_n ?? 20,
+        metadata: options.metadata ?? { instance_id: context.repoId },
+        ...(options.identity ? { identity: options.identity } : {}),
+      },
+      options.session_id
+    );
+    const data = this.objectData(result.data);
+
+    return {
+      output: this.searchOutput(data),
+      metadata: {
+        endpoint: this.memorySearchEndpoint(),
+        repoId: context.repoId,
+        revision: context.revision,
+        ...this.correlationMetadata(data),
+      },
+    };
+  }
+
+  async contextRead(options: ContextReadOptions): Promise<ContextToolResult> {
+    const requestedPath = options.path.trim();
+    if (!requestedPath) {
+      throw new Error('path is required');
+    }
+
+    const context = await this.resolveRepositoryContext(options.directory, options);
+    const body: Record<string, unknown> = {
+      repo_id: context.repoId,
+      revision: context.revision || 'latest',
+      path: requestedPath,
+    };
+    if (options.start_line !== undefined) {
+      body.start_line = options.start_line;
+    }
+    if (options.end_line !== undefined) {
+      body.end_line = options.end_line;
+    }
+    if (options.identity) {
+      body.identity = options.identity;
+    }
+
+    const result = await this.postJson(READ_PATH, body, options.session_id);
+    const data = this.objectData(result.data);
+    const responsePath =
+      typeof data.path === 'string' && data.path ? data.path : requestedPath;
+
+    return {
+      output: this.readOutput(responsePath, data),
+      metadata: {
+        endpoint: READ_PATH,
+        repoId: context.repoId,
+        revision: context.revision,
+        ...this.correlationMetadata(data),
+        path: responsePath,
+      },
     };
   }
 
@@ -296,15 +455,24 @@ export class OpenCodeRuntime {
 
   private async postJson<TBody extends object>(
     endpointPath: string,
-    body: TBody
+    body: TBody,
+    sessionId?: string
   ): Promise<GatewayResult> {
     const upstreamUrl = new URL(endpointPath, this.gatewayUrl).toString();
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const apiKey = process.env.FORMSY_API_KEY;
+    if (apiKey) {
+      headers.Authorization = `Bearer ${apiKey}`;
+    }
+    if (sessionId) {
+      headers['X-Session-ID'] = sessionId;
+    }
 
     let response: Response;
     try {
       response = await fetch(upstreamUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(body),
       });
     } catch (error) {
@@ -351,5 +519,47 @@ export class OpenCodeRuntime {
     } catch {
       return undefined;
     }
+  }
+
+  private memorySearchEndpoint(): string {
+    const raw = process.env.FORMSY_MEMORY_SEARCH_ENDPOINT || SEARCH_PATH;
+    return raw.startsWith('/') ? raw : `/${raw}`;
+  }
+
+  private objectData(data: unknown): Record<string, unknown> {
+    return typeof data === 'object' && data !== null ? data as Record<string, unknown> : {};
+  }
+
+  private searchOutput(data: Record<string, unknown>): string {
+    if (typeof data.extra_context === 'string') {
+      return data.extra_context;
+    }
+    if (typeof data.memory_block === 'string') {
+      return data.memory_block;
+    }
+    return JSON.stringify(data, null, 2);
+  }
+
+  private readOutput(filePath: string, data: Record<string, unknown>): string {
+    const content = typeof data.content === 'string'
+      ? data.content
+      : JSON.stringify(data, null, 2);
+    const startLine = typeof data.start_line === 'number' ? data.start_line : undefined;
+    const endLine = typeof data.end_line === 'number' ? data.end_line : undefined;
+    const lineSuffix = startLine !== undefined
+      ? `:${startLine}${endLine !== undefined ? `-${endLine}` : ''}`
+      : '';
+    return `${filePath}${lineSuffix}\n\n${content}`;
+  }
+
+  private correlationMetadata(data: Record<string, unknown>): Record<string, string> {
+    const metadata: Record<string, string> = {};
+    for (const key of ['observation_id', 'request_id', 'trace_id']) {
+      const value = data[key];
+      if (typeof value === 'string' && value) {
+        metadata[key] = value;
+      }
+    }
+    return metadata;
   }
 }

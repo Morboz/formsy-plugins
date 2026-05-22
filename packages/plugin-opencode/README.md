@@ -4,16 +4,13 @@ Formsy native plugin for OpenCode.
 
 ## What It Does
 
-This package adds two OpenCode custom tools:
+This package adds current Formsy context tools for OpenCode:
 
-- `formsy_compile_repo` scans the current repository, skips test files, and forwards one file at a time to the gateway `/compile` endpoint
-- `formsy_query_context` sends a natural-language task query to the gateway `/query` endpoint to retrieve repository context
+- `context_search` queries the Formsy repository context index through `/api/v1/query`
+- `context_read` reads indexed source content by path through `/api/v1/read`
+- `formsy_compile_repo` scans the current repository, skips tests, and submits source files to `/api/v1/compile`
 
-The tools are thin wrappers around:
-
-- `POST http://localhost:3001/v1/gateway/compile` by default
-- `POST http://localhost:3001/v1/gateway/query` by default
-- or the same paths under `$FORMSY_GATEWAY_URL` if you override the gateway URL
+It also registers OpenCode lifecycle hooks for Formsy observability. The reporter submits task-level counters, hashed file paths, server correlation IDs, and redacted command/task summaries. It does not submit prompts, source content, diffs, or shell output.
 
 ## Installation
 
@@ -21,23 +18,7 @@ The tools are thin wrappers around:
 npm install @formsy/plugin-opencode
 ```
 
-## Configuration
-
-The plugin reads one environment variable:
-
-```bash
-FORMSY_GATEWAY_URL=http://localhost:3001
-```
-
-## Build
-
-```bash
-npm run build --workspace @formsy/plugin-opencode
-```
-
-## Load In OpenCode
-
-For an npm-installed plugin, add it to `opencode.json`:
+Add it to `opencode.json`:
 
 ```json
 {
@@ -46,9 +27,77 @@ For an npm-installed plugin, add it to `opencode.json`:
 }
 ```
 
-For local testing, you can also copy the built plugin into `.opencode/plugins/` and export `FormsyOpenCodePlugin`.
+For local development, run this from the project where you launch OpenCode:
+
+```bash
+npm --prefix /Users/xx/software/wanggen/plugins run build --workspace @formsy/plugin-opencode && mkdir -p .opencode/plugins && ln -sf /Users/xx/software/wanggen/plugins/packages/plugin-opencode/dist/index.js .opencode/plugins/formsy-opencode.js
+```
+
+## Configuration
+
+Runtime API:
+
+```bash
+FORMSY_GATEWAY_URL=http://localhost:3001
+FORMSY_API_KEY=fsy_test_key_dev_only_12345678
+FORMSY_MEMORY_SEARCH_ENDPOINT=/api/v1/query
+```
+
+Observability:
+
+```bash
+FORMSY_OBSERVABILITY_ENABLED=true
+FORMSY_OBSERVABILITY_URL=http://127.0.0.1:8000
+FORMSY_OBSERVABILITY_TASK_REPORT_ENDPOINT=/v1/observations/task_reports
+FORMSY_OBSERVABILITY_SPOOL_DIR=~/.opencode/formsy-observability
+FORMSY_OBSERVABILITY_API_KEY=...
+```
+
+If observability submission fails, reports are written as JSONL under the spool directory.
+
+
+```bash
+export FORMSY_GATEWAY_URL=http://localhost:8000
+export FORMSY_API_KEY=fsy_test_key_dev_only_12345678
+export FORMSY_MEMORY_SEARCH_ENDPOINT=/api/v1/query
+
+export FORMSY_OBSERVABILITY_ENABLED=true
+export FORMSY_OBSERVABILITY_URL=http://127.0.0.1:8000
+export FORMSY_OBSERVABILITY_TASK_REPORT_ENDPOINT=/v1/observations/task_reports
+export FORMSY_OBSERVABILITY_SPOOL_DIR=~/.opencode/formsy-observability
+export FORMSY_OBSERVABILITY_API_KEY=fsy_test_key_dev_only_12345678
+export FORMSY_OBSERVABILITY_TIMEOUT_MS=2000
+```
 
 ## Tools
+
+### `context_search`
+
+Arguments:
+
+- `query` required string
+- `repo_id` optional string override
+- `revision` optional string override
+- `budget` optional positive integer, default `4000`
+- `enable_profiling` optional boolean
+- `profiling_top_n` optional positive integer
+- `metadata` optional object
+- `identity` optional object
+
+Returns the upstream `extra_context` or `memory_block` text with metadata such as `repoId`, `revision`, and correlation IDs.
+
+### `context_read`
+
+Arguments:
+
+- `path` required repository path
+- `repo_id` optional string override
+- `revision` optional string override
+- `start_line` optional positive integer
+- `end_line` optional positive integer
+- `identity` optional object
+
+Returns formatted source content with metadata such as `path`, `repoId`, `revision`, and correlation IDs.
 
 ### `formsy_compile_repo`
 
@@ -65,35 +114,9 @@ Defaults:
 - `revision` prefers `git rev-parse HEAD`
 - source scanning skips test files and common directories such as `node_modules`, `dist`, `build`, `.git`
 
-Returns:
+## Build And Test
 
-- compile summary including `repoId`, `revision`, compiled file paths, skipped file paths, failures, and raw upstream response
-
-Example usage inside OpenCode:
-
-```txt
-Use the formsy_compile_repo tool with:
-enable_w2: true
-```
-
-### `formsy_query_context`
-
-Arguments:
-
-- `query` required string
-- `repo_id` optional string override
-- `revision` optional string override
-- `budget` optional positive integer
-- `metadata` optional object
-
-Returns:
-
-- query metadata plus the raw upstream `/query` response
-
-Example usage inside OpenCode:
-
-```txt
-Use the formsy_query_context tool with:
-query: "Find the modules responsible for authentication and request routing"
-budget: 4000
+```bash
+npm run build --workspace @formsy/plugin-opencode
+npm run test --workspace @formsy/plugin-opencode
 ```
