@@ -80,6 +80,9 @@ test('context_search tool delegates to runtime and returns tool metadata', async
         endpoint: '/api/v1/query',
         repoId: 'repo/example',
         revision: 'abc123',
+        directMatchFiles: [],
+        bundlePrimaryFiles: [],
+        bundleMustEdit: [],
         observation_id: 'obs_tool',
       },
     });

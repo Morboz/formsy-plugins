@@ -134,8 +134,24 @@ export const FormsyOpenCodePlugin: Plugin = async ({ directory, client }) => {
           profiling_top_n: tool.schema.number().int().positive().optional(),
           metadata: tool.schema.record(tool.schema.string(), tool.schema.any()).optional(),
           identity: tool.schema.record(tool.schema.string(), tool.schema.any()).optional(),
+          grounding_phase: tool.schema.string().optional(),
+          grounded_files: tool.schema.array(tool.schema.string()).optional(),
+          test_failure_recovery: tool.schema.boolean().optional(),
         },
         async execute(args, context) {
+          const metadata: Record<string, unknown> = {
+            ...(args.metadata ?? {}),
+          };
+          if (args.grounding_phase) {
+            metadata.grounding_phase = args.grounding_phase;
+          }
+          if (args.grounded_files && args.grounded_files.length > 0) {
+            metadata.grounded_files = args.grounded_files;
+          }
+          if (args.test_failure_recovery) {
+            metadata.test_failure_recovery = true;
+          }
+
           const result = await runtime.contextSearch({
             directory: context.directory,
             query: args.query,
@@ -145,7 +161,7 @@ export const FormsyOpenCodePlugin: Plugin = async ({ directory, client }) => {
             budget: args.budget,
             enable_profiling: args.enable_profiling,
             profiling_top_n: args.profiling_top_n,
-            metadata: args.metadata,
+            metadata,
             identity: args.identity,
           });
 
@@ -159,6 +175,8 @@ export const FormsyOpenCodePlugin: Plugin = async ({ directory, client }) => {
                 revision: result.metadata.revision,
                 budget: args.budget,
                 endpoint: result.metadata.endpoint,
+                grounding_phase: args.grounding_phase,
+                test_failure_recovery: args.test_failure_recovery,
               },
             },
           });

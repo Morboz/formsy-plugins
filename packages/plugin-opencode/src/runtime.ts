@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
@@ -7,6 +8,7 @@ const execFileAsync = promisify(execFile);
 
 const DEFAULT_GATEWAY_URL = 'http://localhost:3001';
 const COMPILE_PATH = '/api/v1/compile';
+const COMPILE_STATUS_PATH = '/api/v1/compile/status';
 const SEARCH_PATH = '/api/v1/query';
 const READ_PATH = '/api/v1/read';
 
@@ -161,7 +163,7 @@ interface SourceFile {
 interface CompileRequestBody {
   repo_id: string;
   revision?: string;
-  mode: 'replace';
+  mode: 'replace' | 'merge';
   removed_paths: string[];
   enable_w2?: boolean;
   metadata: Record<string, unknown>;
@@ -175,12 +177,28 @@ interface CompileRequestBody {
 
 export class OpenCodeRuntime {
   private gatewayUrl: string;
+  private lastAsyncError: string;
+  private compiledIdentity: { repoId: string; revision: string; querySignature: string } | null;
+  private compileRevision: string;
+  private lastTerminalTestFailed: boolean;
+  private failedTestRecoverySearchUsed: boolean;
+  private groundedFiles: string[];
+  private explorationClosed: boolean;
+  private acceptedTargets: string[];
 
   constructor() {
     this.gatewayUrl =
       process.env.FORMSY_GATEWAY_URL ||
       process.env.FORMSY_BASE_URL ||
       DEFAULT_GATEWAY_URL;
+    this.lastAsyncError = '';
+    this.compiledIdentity = null;
+    this.compileRevision = '';
+    this.lastTerminalTestFailed = false;
+    this.failedTestRecoverySearchUsed = false;
+    this.groundedFiles = [];
+    this.explorationClosed = false;
+    this.acceptedTargets = [];
   }
 
   async resolveRepositoryContext(
@@ -208,7 +226,9 @@ export class OpenCodeRuntime {
     options: CompileRepositoryOptions
   ): Promise<CompileRepositoryResult> {
     const context = await this.resolveRepositoryContext(options.directory, options);
-    const sourceFiles = await this.listSourceFiles(context.rootDirectory, options.include);
+    const query = '';
+    const querySignature = this.querySignature(query);
+    const sourceFiles = await this.listSourceFiles(context.rootDirectory, options.include, query);
     const compiledFiles: string[] = [];
     const skippedFiles: string[] = [];
     const failures: Array<{ path: string; error: string }> = [];
@@ -238,10 +258,16 @@ export class OpenCodeRuntime {
       ? await this.postJson<CompileRequestBody>(COMPILE_PATH, {
           repo_id: context.repoId,
           revision: context.revision,
-          mode: 'replace',
+          mode: 'merge',
           removed_paths: [],
           enable_w2: options.enable_w2,
-          metadata: {},
+          metadata: {
+            compile_profile: 'interactive_context_search',
+            source_scope: 'query_bounded',
+            query_signature: querySignature || '*',
+            function_embeddings: 'deferred',
+            sync_function_embeddings: false,
+          },
           files,
         })
       : {
@@ -288,28 +314,118 @@ export class OpenCodeRuntime {
     }
 
     const context = await this.resolveRepositoryContext(options.directory, options);
+    const querySignature = this.querySignature(query);
+
+    // Ensure memory is compiled; check existing compile first
+    const compiled = await this.ensureMemoryCompiled({
+      repoId: context.repoId,
+      revision: context.revision || 'latest',
+      query,
+      querySignature,
+      sessionId: options.session_id,
+      directory: options.directory,
+    });
+
+    if (!compiled) {
+      const errorResponse: Record<string, unknown> = {
+        ok: false,
+        query,
+        repo_id: context.repoId,
+        revision: context.revision,
+        error: 'Formsy memory compile failed before context_search',
+        compile_error: this.lastAsyncError,
+        retrieval_status: 'failed',
+        recovery_mode: 'degraded_recovery',
+        preferred_next_step: 'bounded_shell_inspection',
+        allowed_tools: ['terminal', 'read_file', 'search_files'],
+        retrieval_feedback:
+          'Memory compile failed. Falling back to bounded shell inspection. ' +
+          'Use at most one targeted search_files call, then read_file the likely ' +
+          'target. Do not repeat identical terminal repro commands; patch or rerun ' +
+          'context_search after the server compile issue is fixed.',
+      };
+      return {
+        output: JSON.stringify(errorResponse, null, 2),
+        metadata: {
+          endpoint: this.memorySearchEndpoint(),
+          repoId: context.repoId,
+          revision: context.revision,
+        },
+      };
+    }
+
+    const revision = this.compileRevision || context.revision || 'latest';
+    const budget = options.budget ?? 4000;
+    const metadata: Record<string, unknown> = {
+      ...(options.metadata ?? { instance_id: context.repoId }),
+    };
+
+    // Add timeout hints
+    const timeoutS = Number(process.env.FORMSY_TIMEOUT_S) || 120;
+    const serverWaitBudget = Math.max(10, Math.min(timeoutS - 10, 90));
+    metadata.query_timeout_s = metadata.query_timeout_s ?? serverWaitBudget;
+    metadata.fanout_timeout_s = metadata.fanout_timeout_s ?? serverWaitBudget;
+
+    // Test failure recovery: if last terminal test failed and we have accepted targets,
+    // request a grounded search for recovery
+    if (
+      this.lastTerminalTestFailed &&
+      this.explorationClosed &&
+      this.acceptedTargets.length > 0
+    ) {
+      metadata.grounding_phase = 'grounded';
+      metadata.grounded_files = [...this.acceptedTargets];
+      metadata.test_failure_recovery = true;
+      this.failedTestRecoverySearchUsed = true;
+    }
+
     const result = await this.postJson(
       this.memorySearchEndpoint(),
       {
         repo_id: context.repoId,
         query,
-        revision: context.revision || 'latest',
-        budget: options.budget ?? 4000,
+        revision,
+        budget,
         enable_profiling: options.enable_profiling ?? false,
         profiling_top_n: options.profiling_top_n ?? 20,
-        metadata: options.metadata ?? { instance_id: context.repoId },
+        metadata,
         ...(options.identity ? { identity: options.identity } : {}),
       },
       options.session_id
     );
     const data = this.objectData(result.data);
 
+    // Post-process: propagate memory hints into the payload
+    const outputData: Record<string, unknown> = { ...data };
+    for (const key of [
+      'memory_status',
+      'memory_freshness',
+      'memory_query_hints',
+      'memory_test_hints',
+    ]) {
+      const value = metadata[key];
+      if (value !== undefined && value !== null && value !== '' && !(Array.isArray(value) && value.length === 0)) {
+        outputData[key] = value;
+      }
+    }
+
+    // Track grounded files and accepted targets from the search result
+    this.updateRetrievalState(outputData, metadata);
+
+    // Extract match files for correlation
+    const directMatchFiles = this.extractMatchFiles(outputData.matches);
+    const bundlePrimaryFiles = this.extractBundlePrimaryFiles(outputData.bundle);
+    const bundleMustEdit = this.extractBundleMustEdit(outputData.bundle);
+
     return {
-      output: this.searchOutput(data),
+      output: this.searchOutput(outputData),
       metadata: {
         endpoint: this.memorySearchEndpoint(),
         repoId: context.repoId,
         revision: context.revision,
+        directMatchFiles,
+        bundlePrimaryFiles,
+        bundleMustEdit,
         ...this.correlationMetadata(data),
       },
     };
@@ -354,10 +470,20 @@ export class OpenCodeRuntime {
     };
   }
 
-  async listSourceFiles(directory: string, include?: string[]): Promise<SourceFile[]> {
+  async listSourceFiles(directory: string, include?: string[], query?: string): Promise<SourceFile[]> {
     const files: SourceFile[] = [];
     await this.walkDirectory(directory, directory, files, include);
-    files.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+    if (query) {
+      const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+      files.sort((left, right) => {
+        const leftScore = this.queryScore(left.relativePath, terms);
+        const rightScore = this.queryScore(right.relativePath, terms);
+        if (leftScore !== rightScore) return rightScore - leftScore;
+        return left.relativePath.localeCompare(right.relativePath);
+      });
+    } else {
+      files.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+    }
     return files;
   }
 
@@ -524,6 +650,294 @@ export class OpenCodeRuntime {
   private memorySearchEndpoint(): string {
     const raw = process.env.FORMSY_MEMORY_SEARCH_ENDPOINT || SEARCH_PATH;
     return raw.startsWith('/') ? raw : `/${raw}`;
+  }
+
+  private querySignature(query: string): string {
+    const normalized = (query || '').toLowerCase().split(/\s+/).join(' ');
+    return createHash('sha256').update(normalized).digest('hex');
+  }
+
+  private async ensureMemoryCompiled(options: {
+    repoId: string;
+    revision: string;
+    query: string;
+    querySignature: string;
+    sessionId?: string;
+    directory: string;
+  }): Promise<boolean> {
+    const { repoId, revision, query, querySignature, sessionId, directory } = options;
+
+    // Check if current compiled identity satisfies this query
+    if (this.compiledIdentitySatisfies(repoId, revision, querySignature)) {
+      return true;
+    }
+
+    // Check if server already has a compile that satisfies this query
+    const status = await this.compileStatus(repoId, revision, sessionId);
+    if (status && this.existingCompileSatisfiesQuery(status, query)) {
+      this.compiledIdentity = this.compiledIdentityFromStatus(
+        status,
+        repoId,
+        revision,
+        querySignature,
+      );
+      const statusRevision =
+        typeof status.revision === 'string' && status.revision.trim()
+          ? status.revision.trim()
+          : revision;
+      this.compileRevision = statusRevision || revision;
+      return true;
+    }
+
+    // Need to compile: collect files and submit
+    const sourceFiles = await this.listSourceFiles(directory, undefined, query);
+    const files: CompileRequestBody['files'] = [];
+
+    for (const file of sourceFiles) {
+      try {
+        const content = await readFile(file.absolutePath, 'utf8');
+        files.push({
+          path: file.relativePath,
+          content,
+          language: this.detectLanguage(file.relativePath),
+          is_test: false,
+        });
+      } catch {
+        // Skip unreadable files
+      }
+    }
+
+    this.lastAsyncError = '';
+    try {
+      await this.postJson<CompileRequestBody>(COMPILE_PATH, {
+        repo_id: repoId,
+        revision,
+        mode: 'merge',
+        removed_paths: [],
+        metadata: {
+          compile_profile: 'interactive_context_search',
+          source_scope: 'query_bounded',
+          query_signature: querySignature,
+          function_embeddings: 'deferred',
+          sync_function_embeddings: false,
+          instance_id: repoId,
+          query,
+          source_file_count: files.length,
+        },
+        files,
+      }, sessionId);
+    } catch (error) {
+      this.lastAsyncError = error instanceof Error ? error.message : String(error);
+      return false;
+    }
+
+    this.compiledIdentity = { repoId, revision, querySignature };
+    this.compileRevision = revision;
+    return true;
+  }
+
+  private async compileStatus(
+    repoId: string,
+    revision: string,
+    sessionId?: string,
+  ): Promise<Record<string, unknown> | null> {
+    try {
+      const result = await this.postJson(
+        COMPILE_STATUS_PATH,
+        { repo_id: repoId, revision },
+        sessionId,
+      );
+      const data = this.objectData(result.data);
+      return Object.keys(data).length > 0 ? data : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private compiledIdentitySatisfies(
+    repoId: string,
+    revision: string,
+    querySignature: string,
+  ): boolean {
+    if (!this.compiledIdentity) return false;
+    const { repoId: cRepo, revision: cRev, querySignature: cQuery } = this.compiledIdentity;
+    if (cRepo !== repoId || cRev !== revision) return false;
+    return cQuery === '*' || cQuery === querySignature;
+  }
+
+  private compiledIdentityFromStatus(
+    status: Record<string, unknown>,
+    repoId: string,
+    revision: string,
+    fallbackQuerySignature: string,
+  ): { repoId: string; revision: string; querySignature: string } {
+    const metadata = typeof status.metadata === 'object' && status.metadata !== null
+      ? status.metadata as Record<string, unknown>
+      : {};
+    const statusRevision = typeof status.revision === 'string' && status.revision.trim()
+      ? status.revision.trim()
+      : revision;
+
+    if (String(metadata.source_scope || '').trim().toLowerCase() === 'full') {
+      return { repoId, revision: statusRevision, querySignature: '*' };
+    }
+    const profile = String(metadata.compile_profile || '').trim().toLowerCase();
+    const parsedFileCount = this.coercePositiveInt(status.parsed_file_count, 0);
+    if (profile !== 'interactive_context_search' && parsedFileCount > 260) {
+      return { repoId, revision: statusRevision, querySignature: '*' };
+    }
+    const signature = String(metadata.query_signature || '').trim();
+    if (signature) {
+      return { repoId, revision: statusRevision, querySignature: signature };
+    }
+    return { repoId, revision, querySignature: fallbackQuerySignature };
+  }
+
+  private existingCompileSatisfiesQuery(
+    status: Record<string, unknown>,
+    query: string,
+  ): boolean {
+    const metadata = typeof status.metadata === 'object' && status.metadata !== null
+      ? status.metadata as Record<string, unknown>
+      : {};
+
+    if (String(metadata.source_scope || '').trim().toLowerCase() === 'full') {
+      return true;
+    }
+
+    const profile = String(metadata.compile_profile || '').trim().toLowerCase();
+    const looksQueryBounded = !!(
+      profile === 'interactive_context_search' ||
+      metadata.query ||
+      metadata.source_file_count
+    );
+    const parsedFileCount = this.coercePositiveInt(status.parsed_file_count, 0);
+    if (!looksQueryBounded && parsedFileCount > 260) {
+      return true;
+    }
+
+    const signature = String(metadata.query_signature || '').trim();
+    if (signature && signature === this.querySignature(query)) {
+      return true;
+    }
+
+    const previousQuery = String(metadata.query || '').toLowerCase().split(/\s+/).join(' ').trim();
+    const currentQuery = (query || '').toLowerCase().split(/\s+/).join(' ').trim();
+    return !!(previousQuery && previousQuery === currentQuery);
+  }
+
+  private coercePositiveInt(value: unknown, fallback: number): number {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+  }
+
+  private queryScore(relativePath: string, terms: string[]): number {
+    if (terms.length === 0) return 0;
+    const normalized = relativePath.toLowerCase();
+    let score = 0;
+    for (const term of terms) {
+      if (normalized.includes(term)) {
+        score += 1;
+      }
+    }
+    return score;
+  }
+
+  private updateRetrievalState(
+    data: Record<string, unknown>,
+    metadata: Record<string, unknown>,
+  ): void {
+    // Extract grounded files from result
+    const groundedFiles = this.coerceStringList(data.grounded_files) ||
+      this.coerceStringList(metadata.grounded_files);
+    if (groundedFiles.length > 0) {
+      this.groundedFiles = groundedFiles;
+    }
+
+    // Extract accepted targets
+    const acceptedTargets = this.coerceStringList(data.accepted_targets);
+    if (acceptedTargets.length > 0) {
+      this.acceptedTargets = acceptedTargets;
+    }
+
+    // Track exploration closed state
+    if (data.exploration_closed === true || data.exploration_closed === 'true') {
+      this.explorationClosed = true;
+    }
+
+    // If test failure recovery was used and we got a result, reset the flag
+    if (metadata.test_failure_recovery) {
+      this.lastTerminalTestFailed = false;
+    }
+  }
+
+  private coerceStringList(value: unknown): string[] {
+    if (Array.isArray(value)) {
+      return value.filter((item): item is string => typeof item === 'string' && item.trim() !== '');
+    }
+    if (typeof value === 'string' && value.trim()) {
+      return [value.trim()];
+    }
+    return [];
+  }
+
+  private extractMatchFiles(matches: unknown): string[] {
+    if (!Array.isArray(matches)) return [];
+    const files: string[] = [];
+    for (const match of matches) {
+      if (typeof match === 'object' && match !== null) {
+        const filePath = (match as Record<string, unknown>).file_path ?? (match as Record<string, unknown>).path;
+        if (typeof filePath === 'string' && filePath.trim()) {
+          files.push(filePath.trim());
+        }
+      }
+    }
+    return files;
+  }
+
+  private extractBundlePrimaryFiles(bundle: unknown): string[] {
+    if (typeof bundle !== 'object' || bundle === null) return [];
+    const b = bundle as Record<string, unknown>;
+    const editTargets = typeof b.edit_targets === 'object' && b.edit_targets !== null
+      ? b.edit_targets as Record<string, unknown>
+      : undefined;
+    const primary = b.primary_files ?? editTargets?.primary ?? b.bundle_primary_files;
+    if (Array.isArray(primary)) {
+      return primary
+        .filter((item): item is string => typeof item === 'string')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+    return [];
+  }
+
+  private extractBundleMustEdit(bundle: unknown): string[] {
+    if (typeof bundle !== 'object' || bundle === null) return [];
+    const b = bundle as Record<string, unknown>;
+    const editTargets = typeof b.edit_targets === 'object' && b.edit_targets !== null
+      ? b.edit_targets as Record<string, unknown>
+      : undefined;
+    const mustEdit = b.must_edit_files ?? editTargets?.must_edit;
+    if (typeof mustEdit === 'string') return [mustEdit];
+    if (Array.isArray(mustEdit)) {
+      return mustEdit
+        .filter((item): item is string => typeof item === 'string')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+    // Also check primary_files with priority=must_edit
+    const primaryFiles = b.primary_files;
+    if (Array.isArray(primaryFiles)) {
+      return primaryFiles
+        .filter((item): item is Record<string, unknown> =>
+          typeof item === 'object' && item !== null && String(item.priority || '').trim().toLowerCase() === 'must_edit')
+        .map((item) => {
+          const p = item.path ?? item.file;
+          return typeof p === 'string' ? p.trim() : '';
+        })
+        .filter(Boolean);
+    }
+    return [];
   }
 
   private objectData(data: unknown): Record<string, unknown> {
