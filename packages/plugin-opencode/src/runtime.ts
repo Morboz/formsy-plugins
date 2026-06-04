@@ -745,32 +745,67 @@ export class OpenCodeRuntime {
     }
 
     // ── Concurrency guard ──────────────────────────────────────────────
-    // If a compile for this repo+revision is already in-flight, await it
-    // instead of submitting a duplicate request, which can cause write
-    // conflicts on the server.
+    // Serialize compiles for the same repo+revision by chaining
+    // each new request onto the tail of the in-flight promise, so
+    // concurrent calls never submit overlapping compile requests.
     const lockKey = `${repoId}:${revision}`;
     const existing = this.compileInProgress.get(lockKey);
-    if (existing) {
-      return existing;
-    }
 
-    // Need to compile: collect files and submit
-    const compilePromise = this._doCompile({
-      repoId,
-      revision,
-      query,
-      querySignature,
-      directory,
-      worktreePaths,
-      sessionId,
-    });
+    const compilePromise: Promise<boolean> = existing
+      ? existing.then(async () => {
+          // Re-check after the prior compile finishes — it may have
+          // satisfied our query.
+          if (this.compiledIdentitySatisfies(repoId, revision, querySignature)) {
+            return true;
+          }
+          // Re-check server status — the prior compile may have
+          // uploaded a broader compile that covers our query.
+          const serverStatus = await this.compileStatus(repoId, revision, sessionId);
+          if (serverStatus && this.existingCompileSatisfiesQuery(serverStatus, query)) {
+            this.compiledIdentity = this.compiledIdentityFromStatus(
+              serverStatus,
+              repoId,
+              revision,
+              querySignature,
+            );
+            const statusRevision =
+              typeof serverStatus.revision === 'string' && serverStatus.revision.trim()
+                ? serverStatus.revision.trim()
+                : revision;
+            this.compileRevision = statusRevision || revision;
+            return true;
+          }
+          // Compile is still needed — run it now.
+          return this._doCompile({
+            repoId,
+            revision,
+            query,
+            querySignature,
+            directory,
+            worktreePaths,
+            sessionId,
+          });
+        })
+      : this._doCompile({
+          repoId,
+          revision,
+          query,
+          querySignature,
+          directory,
+          worktreePaths,
+          sessionId,
+        });
 
     this.compileInProgress.set(lockKey, compilePromise);
 
     try {
       return await compilePromise;
     } finally {
-      this.compileInProgress.delete(lockKey);
+      // Only remove the sentinel if it still points to this promise —
+      // a chained promise may have replaced us.
+      if (this.compileInProgress.get(lockKey) === compilePromise) {
+        this.compileInProgress.delete(lockKey);
+      }
     }
   }
 

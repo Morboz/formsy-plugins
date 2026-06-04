@@ -258,6 +258,164 @@ test('listSourceFiles skips .worktrees directory via IGNORED_DIRECTORIES', async
   }
 });
 
+test('concurrent contextSearch calls with same query serialize compile into one request', async () => {
+  const calls: Array<{ url: string; body: unknown; headers: HeadersInit | undefined }> = [];
+  const originalFetch = globalThis.fetch;
+  process.env.FORMSY_GATEWAY_URL = 'http://formsy.test';
+
+  // Block compile until both callers have entered the concurrency guard
+  let compileResolve: () => void;
+  const compileBlocker = new Promise<void>((resolve) => {
+    compileResolve = resolve;
+  });
+
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    calls.push({
+      url,
+      body: init?.body ? JSON.parse(String(init.body)) : {},
+      headers: init?.headers,
+    });
+    if (url.endsWith('/api/v1/compile/status')) {
+      return jsonResponse({});
+    }
+    if (url.endsWith('/api/v1/compile')) {
+      await compileBlocker;
+      return jsonResponse({ ok: true });
+    }
+    return jsonResponse({ extra_context: 'searched context', observation_id: 'obs_1' });
+  };
+
+  const directory = await mkdtemp(path.join(tmpdir(), 'formsy-opencode-'));
+  try {
+    const runtime = new OpenCodeRuntime();
+
+    // Fire two concurrent contextSearch calls
+    const p1 = runtime.contextSearch({
+      directory,
+      repo_id: 'repo/example',
+      revision: 'abc123',
+      query: 'Where is auth?',
+      budget: 5000,
+    });
+    const p2 = runtime.contextSearch({
+      directory,
+      repo_id: 'repo/example',
+      revision: 'abc123',
+      query: 'Where is auth?',
+      budget: 5000,
+    });
+
+    // Let both calls reach the concurrency guard, then unblock compile
+    await new Promise((r) => setTimeout(r, 50));
+    compileResolve!();
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+
+    assert.equal(r1.output, 'searched context');
+    assert.equal(r2.output, 'searched context');
+
+    // Only ONE compile POST should have been made
+    const compileCalls = calls.filter(
+      (c) => c.url.endsWith('/api/v1/compile') && !c.url.includes('status'),
+    );
+    assert.equal(compileCalls.length, 1, 'should only submit one compile request');
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.FORMSY_GATEWAY_URL;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('concurrent contextSearch calls with different queries chain compiles sequentially', async () => {
+  const calls: Array<{ url: string; body: unknown; headers: HeadersInit | undefined }> = [];
+  const originalFetch = globalThis.fetch;
+  process.env.FORMSY_GATEWAY_URL = 'http://formsy.test';
+
+  let firstCompileResolve: () => void;
+  const firstCompileBlocker = new Promise<void>((resolve) => {
+    firstCompileResolve = resolve;
+  });
+
+  let compileCount = 0;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    calls.push({
+      url,
+      body: init?.body ? JSON.parse(String(init.body)) : {},
+      headers: init?.headers,
+    });
+    if (url.endsWith('/api/v1/compile/status')) {
+      return jsonResponse({});
+    }
+    if (url.endsWith('/api/v1/compile')) {
+      compileCount++;
+      if (compileCount === 1) {
+        // Block the first compile so the second caller chains behind it
+        await firstCompileBlocker;
+      }
+      return jsonResponse({ ok: true });
+    }
+    return jsonResponse({ extra_context: 'searched context', observation_id: 'obs_1' });
+  };
+
+  const directory = await mkdtemp(path.join(tmpdir(), 'formsy-opencode-'));
+  try {
+    const runtime = new OpenCodeRuntime();
+
+    // Two concurrent calls with different queries
+    const p1 = runtime.contextSearch({
+      directory,
+      repo_id: 'repo/example',
+      revision: 'abc123',
+      query: 'Where is auth?',
+      budget: 5000,
+    });
+    const p2 = runtime.contextSearch({
+      directory,
+      repo_id: 'repo/example',
+      revision: 'abc123',
+      query: 'How does login work?',
+      budget: 5000,
+    });
+
+    // Let call 1 enter the guard and start its compile; call 2 chains
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Verify the second compile hasn't started yet (still blocked on chain)
+    assert.equal(compileCount, 1, 'second compile should not start until first finishes');
+
+    // Unblock the first compile
+    firstCompileResolve!();
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+
+    assert.equal(r1.output, 'searched context');
+    assert.equal(r2.output, 'searched context');
+
+    // Two compiles because different queries have different querySignatures
+    const compileCalls = calls.filter(
+      (c) => c.url.endsWith('/api/v1/compile') && !c.url.includes('status'),
+    );
+    assert.equal(compileCalls.length, 2, 'different queries need separate compiles');
+    assert.equal(compileCount, 2, 'both compiles should be serialized, not concurrent');
+
+    // Verify first compile has query_1 signature, second has query_2
+    assert.ok(
+      (compileCalls[0].body as Record<string, unknown>).metadata,
+      'first compile should have metadata',
+    );
+    assert.ok(
+      (compileCalls[1].body as Record<string, unknown>).metadata,
+      'second compile should have metadata',
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.FORMSY_GATEWAY_URL;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('resolveRepositoryContext includes worktreePaths from git', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'formsy-opencode-'));
   // Initialize a git repo so resolveRepositoryContext works
