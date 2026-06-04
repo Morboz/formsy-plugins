@@ -14,9 +14,11 @@ const READ_PATH = '/api/v1/read';
 
 const IGNORED_DIRECTORIES = new Set([
   '.cache',
+  '.claude',
   '.git',
   '.next',
   '.turbo',
+  '.worktrees',
   'build',
   'coverage',
   'dist',
@@ -97,6 +99,7 @@ export interface RepositoryContext {
   repoId: string;
   revision?: string;
   rootDirectory: string;
+  worktreePaths?: string[];
 }
 
 export interface CompileRepositoryResult extends GatewayResult {
@@ -214,11 +217,13 @@ export class OpenCodeRuntime {
     const repoId = overrides.repo_id || normalizeRepoId(remoteUrl, rootDirectory, directory);
     const revision =
       overrides.revision || (await this.runGit(['rev-parse', 'HEAD'], rootDirectory)) || undefined;
+    const worktreePaths = await this.listWorktreeDirectories(rootDirectory);
 
     return {
       repoId,
       revision,
       rootDirectory,
+      worktreePaths,
     };
   }
 
@@ -228,7 +233,7 @@ export class OpenCodeRuntime {
     const context = await this.resolveRepositoryContext(options.directory, options);
     const query = '';
     const querySignature = this.querySignature(query);
-    const sourceFiles = await this.listSourceFiles(context.rootDirectory, options.include, query);
+    const sourceFiles = await this.listSourceFiles(context.rootDirectory, options.include, query, context.worktreePaths);
     const compiledFiles: string[] = [];
     const skippedFiles: string[] = [];
     const failures: Array<{ path: string; error: string }> = [];
@@ -324,6 +329,7 @@ export class OpenCodeRuntime {
       querySignature,
       sessionId: options.session_id,
       directory: options.directory,
+      worktreePaths: context.worktreePaths,
     });
 
     if (!compiled) {
@@ -470,9 +476,10 @@ export class OpenCodeRuntime {
     };
   }
 
-  async listSourceFiles(directory: string, include?: string[], query?: string): Promise<SourceFile[]> {
+  async listSourceFiles(directory: string, include?: string[], query?: string, worktreePaths?: string[]): Promise<SourceFile[]> {
+    const resolvedWorktreePaths = worktreePaths ?? await this.listWorktreeDirectories(directory);
     const files: SourceFile[] = [];
-    await this.walkDirectory(directory, directory, files, include);
+    await this.walkDirectory(directory, directory, files, include, resolvedWorktreePaths);
     if (query) {
       const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
       files.sort((left, right) => {
@@ -491,7 +498,8 @@ export class OpenCodeRuntime {
     rootDirectory: string,
     currentDirectory: string,
     files: SourceFile[],
-    include?: string[]
+    include?: string[],
+    worktreePaths?: string[]
   ): Promise<void> {
     const entries = await readdir(currentDirectory, { withFileTypes: true });
 
@@ -503,7 +511,14 @@ export class OpenCodeRuntime {
         if (IGNORED_DIRECTORIES.has(entry.name) || TEST_SEGMENTS.has(entry.name)) {
           continue;
         }
-        await this.walkDirectory(rootDirectory, absolutePath, files, include);
+        // Skip git worktree directories to avoid compiling duplicate source files
+        if (worktreePaths && worktreePaths.some(wt => {
+          const resolved = path.resolve(absolutePath);
+          return resolved === wt || resolved.startsWith(wt + path.sep);
+        })) {
+          continue;
+        }
+        await this.walkDirectory(rootDirectory, absolutePath, files, include, worktreePaths);
         continue;
       }
 
@@ -595,16 +610,26 @@ export class OpenCodeRuntime {
     }
 
     let response: Response;
+    const timeoutMs = (Number(process.env.FORMSY_REQUEST_TIMEOUT_S) || 300) * 1000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       response = await fetch(upstreamUrl, {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : 'Failed to reach gateway service';
+        error instanceof DOMException && error.name === 'AbortError'
+          ? `Gateway request timed out after ${timeoutMs / 1000}s`
+          : error instanceof Error
+            ? error.message
+            : 'Failed to reach gateway service';
       throw new Error(`Gateway request failed: ${message}`);
+    } finally {
+      clearTimeout(timer);
     }
 
     let data: unknown;
@@ -647,6 +672,28 @@ export class OpenCodeRuntime {
     }
   }
 
+  private async listWorktreeDirectories(rootDirectory: string): Promise<string[]> {
+    const output = await this.runGit(['worktree', 'list', '--porcelain'], rootDirectory);
+    if (!output) return [];
+
+    const resolvedRoot = path.resolve(rootDirectory);
+    const paths: string[] = [];
+    for (const line of output.split('\n')) {
+      if (!line.startsWith('worktree ')) continue;
+      const wtPath = line.substring('worktree '.length);
+      // Only include worktrees that are subdirectories of rootDirectory (exclude rootDirectory itself)
+      // Use path.resolve + path.relative for cross-platform compatibility (Windows git uses / separators)
+      const resolved = path.resolve(wtPath);
+      if (resolved !== resolvedRoot) {
+        const relative = path.relative(resolvedRoot, resolved);
+        if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
+          paths.push(resolved);
+        }
+      }
+    }
+    return paths;
+  }
+
   private memorySearchEndpoint(): string {
     const raw = process.env.FORMSY_MEMORY_SEARCH_ENDPOINT || SEARCH_PATH;
     return raw.startsWith('/') ? raw : `/${raw}`;
@@ -664,8 +711,9 @@ export class OpenCodeRuntime {
     querySignature: string;
     sessionId?: string;
     directory: string;
+    worktreePaths?: string[];
   }): Promise<boolean> {
-    const { repoId, revision, query, querySignature, sessionId, directory } = options;
+    const { repoId, revision, query, querySignature, sessionId, directory, worktreePaths } = options;
 
     // Check if current compiled identity satisfies this query
     if (this.compiledIdentitySatisfies(repoId, revision, querySignature)) {
@@ -690,7 +738,7 @@ export class OpenCodeRuntime {
     }
 
     // Need to compile: collect files and submit
-    const sourceFiles = await this.listSourceFiles(directory, undefined, query);
+    const sourceFiles = await this.listSourceFiles(directory, undefined, query, worktreePaths);
     const files: CompileRequestBody['files'] = [];
 
     for (const file of sourceFiles) {
