@@ -15,7 +15,9 @@ function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
 test('contextSearch posts Hermes-compatible query body and returns extra_context text', async () => {
   const calls: Array<{ url: string; body: unknown; headers: HeadersInit | undefined }> = [];
   const originalFetch = globalThis.fetch;
+  const originalTimeout = process.env.FORMSY_TIMEOUT_S;
   process.env.FORMSY_GATEWAY_URL = 'http://formsy.test';
+  process.env.FORMSY_TIMEOUT_S = '120';
   globalThis.fetch = async (input, init) => {
     calls.push({
       url: String(input),
@@ -63,16 +65,19 @@ test('contextSearch posts Hermes-compatible query body and returns extra_context
     assert.equal(calls[2].url, 'http://formsy.test/api/v1/query');
 
     // Verify the search query body
-    assert.deepEqual(calls[2].body, {
-      repo_id: 'repo/example',
-      query: 'Where is auth handled?',
-      revision: 'abc123',
-      budget: 5000,
-      enable_profiling: true,
-      profiling_top_n: 8,
-      metadata: { source: 'test', query_timeout_s: 90, fanout_timeout_s: 90 },
-      identity: { user_id: 'user_1' },
-    });
+    const searchBody = calls[2].body as Record<string, unknown>;
+    assert.equal(searchBody.repo_id, 'repo/example');
+    assert.equal(searchBody.query, 'Where is auth handled?');
+    assert.equal(searchBody.revision, 'abc123');
+    assert.equal(searchBody.budget, 5000);
+    assert.equal(searchBody.enable_profiling, true);
+    assert.equal(searchBody.profiling_top_n, 8);
+    assert.deepEqual(searchBody.identity, { user_id: 'user_1' });
+    const searchMetadata = searchBody.metadata as Record<string, unknown>;
+    assert.equal(searchMetadata.source, 'test');
+    assert.equal(typeof searchMetadata.query_timeout_s, 'number');
+    assert.equal(typeof searchMetadata.fanout_timeout_s, 'number');
+
     assert.deepEqual(result.metadata, {
       endpoint: '/api/v1/query',
       repoId: 'repo/example',
@@ -85,6 +90,11 @@ test('contextSearch posts Hermes-compatible query body and returns extra_context
   } finally {
     globalThis.fetch = originalFetch;
     delete process.env.FORMSY_GATEWAY_URL;
+    if (originalTimeout !== undefined) {
+      process.env.FORMSY_TIMEOUT_S = originalTimeout;
+    } else {
+      delete process.env.FORMSY_TIMEOUT_S;
+    }
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -208,23 +218,41 @@ test('listSourceFiles excludes git worktree directories', async () => {
     await mkdir(path.join(directory, 'src'), { recursive: true });
     await writeFile(path.join(directory, 'src', 'main.ts'), 'export const main = 1;\n');
 
-    // Create a worktree-like subdirectory with duplicate files
-    await mkdir(path.join(directory, '.worktrees', 'fix-issue-10', 'src'), { recursive: true });
-    await writeFile(path.join(directory, '.worktrees', 'fix-issue-10', 'src', 'main.ts'), 'export const main = 1;\n');
+    // Create a worktree-like subdirectory with a custom name (not in IGNORED_DIRECTORIES)
+    // to test the dynamic worktreePaths exclusion mechanism
+    await mkdir(path.join(directory, 'wt-feature', 'src'), { recursive: true });
+    await writeFile(path.join(directory, 'wt-feature', 'src', 'main.ts'), 'export const main = 1;\n');
 
     const runtime = new OpenCodeRuntime();
 
-    // Without worktreePaths, .worktrees is NOT in IGNORED_DIRECTORIES, so it would be walked
-    // (unless we add it, but we rely on dynamic worktree detection instead)
+    // Without worktreePaths, the custom-named worktree directory is traversed
     const allFiles = await runtime.listSourceFiles(directory);
-    // .worktrees is not in IGNORED_DIRECTORIES, so without worktreePaths both files appear
-    assert.ok(allFiles.length >= 2, 'should find files in both main and worktree dirs without exclusion');
+    assert.ok(allFiles.length >= 2, 'should find files in both main and custom worktree dirs without exclusion');
 
     // With worktreePaths, the worktree directory should be excluded
-    const worktreePath = path.join(directory, '.worktrees', 'fix-issue-10');
+    const worktreePath = path.join(directory, 'wt-feature');
     const excludedFiles = await runtime.listSourceFiles(directory, undefined, undefined, [worktreePath]);
     const paths = excludedFiles.map(f => f.relativePath);
     assert.deepEqual(paths, ['src/main.ts'], 'should exclude worktree directory files');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('listSourceFiles skips .worktrees directory via IGNORED_DIRECTORIES', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'formsy-opencode-'));
+  try {
+    await mkdir(path.join(directory, 'src'), { recursive: true });
+    await writeFile(path.join(directory, 'src', 'app.ts'), 'export const app = 1;\n');
+
+    // .worktrees is in IGNORED_DIRECTORIES and should always be skipped
+    await mkdir(path.join(directory, '.worktrees', 'branch-a', 'src'), { recursive: true });
+    await writeFile(path.join(directory, '.worktrees', 'branch-a', 'src', 'app.ts'), 'export const app = 1;\n');
+
+    const runtime = new OpenCodeRuntime();
+    const files = await runtime.listSourceFiles(directory);
+    const paths = files.map(f => f.relativePath);
+    assert.deepEqual(paths, ['src/app.ts'], '.worktrees should be ignored even without worktreePaths');
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

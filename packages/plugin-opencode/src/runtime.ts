@@ -18,6 +18,7 @@ const IGNORED_DIRECTORIES = new Set([
   '.git',
   '.next',
   '.turbo',
+  '.worktrees',
   'build',
   'coverage',
   'dist',
@@ -98,7 +99,7 @@ export interface RepositoryContext {
   repoId: string;
   revision?: string;
   rootDirectory: string;
-  worktreePaths: string[];
+  worktreePaths?: string[];
 }
 
 export interface CompileRepositoryResult extends GatewayResult {
@@ -511,7 +512,10 @@ export class OpenCodeRuntime {
           continue;
         }
         // Skip git worktree directories to avoid compiling duplicate source files
-        if (worktreePaths && worktreePaths.some(wt => absolutePath === wt || absolutePath.startsWith(wt + path.sep))) {
+        if (worktreePaths && worktreePaths.some(wt => {
+          const resolved = path.resolve(absolutePath);
+          return resolved === wt || resolved.startsWith(wt + path.sep);
+        })) {
           continue;
         }
         await this.walkDirectory(rootDirectory, absolutePath, files, include, worktreePaths);
@@ -662,13 +666,19 @@ export class OpenCodeRuntime {
     const output = await this.runGit(['worktree', 'list', '--porcelain'], rootDirectory);
     if (!output) return [];
 
+    const resolvedRoot = path.resolve(rootDirectory);
     const paths: string[] = [];
     for (const line of output.split('\n')) {
       if (!line.startsWith('worktree ')) continue;
       const wtPath = line.substring('worktree '.length);
       // Only include worktrees that are subdirectories of rootDirectory (exclude rootDirectory itself)
-      if (wtPath !== rootDirectory && wtPath.startsWith(rootDirectory + path.sep)) {
-        paths.push(wtPath);
+      // Use path.resolve + path.relative for cross-platform compatibility (Windows git uses / separators)
+      const resolved = path.resolve(wtPath);
+      if (resolved !== resolvedRoot) {
+        const relative = path.relative(resolvedRoot, resolved);
+        if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
+          paths.push(resolved);
+        }
       }
     }
     return paths;
