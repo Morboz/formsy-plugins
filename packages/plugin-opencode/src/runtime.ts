@@ -189,6 +189,12 @@ export class OpenCodeRuntime {
   private explorationClosed: boolean;
   private acceptedTargets: string[];
 
+  /** Track in-progress compiles keyed by `${repoId}:${revision}` to prevent
+   *  concurrent compile requests for the same repository, which can cause
+   *  write conflicts on the server.  The promise resolves to the same boolean
+   *  that ensureMemoryCompiled would return. */
+  private compileInProgress: Map<string, Promise<boolean>>;
+
   constructor() {
     this.gatewayUrl =
       process.env.FORMSY_GATEWAY_URL ||
@@ -202,6 +208,7 @@ export class OpenCodeRuntime {
     this.groundedFiles = [];
     this.explorationClosed = false;
     this.acceptedTargets = [];
+    this.compileInProgress = new Map();
   }
 
   async resolveRepositoryContext(
@@ -737,7 +744,49 @@ export class OpenCodeRuntime {
       return true;
     }
 
+    // ── Concurrency guard ──────────────────────────────────────────────
+    // If a compile for this repo+revision is already in-flight, await it
+    // instead of submitting a duplicate request, which can cause write
+    // conflicts on the server.
+    const lockKey = `${repoId}:${revision}`;
+    const existing = this.compileInProgress.get(lockKey);
+    if (existing) {
+      return existing;
+    }
+
     // Need to compile: collect files and submit
+    const compilePromise = this._doCompile({
+      repoId,
+      revision,
+      query,
+      querySignature,
+      directory,
+      worktreePaths,
+      sessionId,
+    });
+
+    this.compileInProgress.set(lockKey, compilePromise);
+
+    try {
+      return await compilePromise;
+    } finally {
+      this.compileInProgress.delete(lockKey);
+    }
+  }
+
+  /** Execute the actual compile request.  Extracted so concurrency
+   *  guard in ensureMemoryCompiled can hold a promise for the result. */
+  private async _doCompile(options: {
+    repoId: string;
+    revision: string;
+    query: string;
+    querySignature: string;
+    sessionId?: string;
+    directory: string;
+    worktreePaths?: string[];
+  }): Promise<boolean> {
+    const { repoId, revision, query, querySignature, sessionId, directory, worktreePaths } = options;
+
     const sourceFiles = await this.listSourceFiles(directory, undefined, query, worktreePaths);
     const files: CompileRequestBody['files'] = [];
 
