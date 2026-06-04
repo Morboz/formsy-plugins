@@ -22,6 +22,16 @@ test('contextSearch posts Hermes-compatible query body and returns extra_context
       body: JSON.parse(String(init?.body)),
       headers: init?.headers,
     });
+    // compile/status returns empty object (no existing compile)
+    // compile POST returns success
+    // query POST returns search result
+    const url = String(input);
+    if (url.endsWith('/api/v1/compile/status')) {
+      return jsonResponse({});
+    }
+    if (url.endsWith('/api/v1/compile')) {
+      return jsonResponse({ ok: true });
+    }
     return jsonResponse({
       extra_context: 'focused repo context',
       observation_id: 'obs_123',
@@ -45,22 +55,31 @@ test('contextSearch posts Hermes-compatible query body and returns extra_context
     });
 
     assert.equal(result.output, 'focused repo context');
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].url, 'http://formsy.test/api/v1/query');
-    assert.deepEqual(calls[0].body, {
+
+    // contextSearch calls: compileStatus, compile, then query
+    assert.equal(calls.length, 3);
+    assert.equal(calls[0].url, 'http://formsy.test/api/v1/compile/status');
+    assert.equal(calls[1].url, 'http://formsy.test/api/v1/compile');
+    assert.equal(calls[2].url, 'http://formsy.test/api/v1/query');
+
+    // Verify the search query body
+    assert.deepEqual(calls[2].body, {
       repo_id: 'repo/example',
       query: 'Where is auth handled?',
       revision: 'abc123',
       budget: 5000,
       enable_profiling: true,
       profiling_top_n: 8,
-      metadata: { source: 'test' },
+      metadata: { source: 'test', query_timeout_s: 90, fanout_timeout_s: 90 },
       identity: { user_id: 'user_1' },
     });
     assert.deepEqual(result.metadata, {
       endpoint: '/api/v1/query',
       repoId: 'repo/example',
       revision: 'abc123',
+      directMatchFiles: [],
+      bundlePrimaryFiles: [],
+      bundleMustEdit: [],
       observation_id: 'obs_123',
     });
   } finally {
@@ -178,6 +197,59 @@ test('contextRead posts Hermes-compatible read body and returns formatted source
   } finally {
     globalThis.fetch = originalFetch;
     delete process.env.FORMSY_GATEWAY_URL;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('listSourceFiles excludes git worktree directories', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'formsy-opencode-'));
+  try {
+    // Create main source files
+    await mkdir(path.join(directory, 'src'), { recursive: true });
+    await writeFile(path.join(directory, 'src', 'main.ts'), 'export const main = 1;\n');
+
+    // Create a worktree-like subdirectory with duplicate files
+    await mkdir(path.join(directory, '.worktrees', 'fix-issue-10', 'src'), { recursive: true });
+    await writeFile(path.join(directory, '.worktrees', 'fix-issue-10', 'src', 'main.ts'), 'export const main = 1;\n');
+
+    const runtime = new OpenCodeRuntime();
+
+    // Without worktreePaths, .worktrees is NOT in IGNORED_DIRECTORIES, so it would be walked
+    // (unless we add it, but we rely on dynamic worktree detection instead)
+    const allFiles = await runtime.listSourceFiles(directory);
+    // .worktrees is not in IGNORED_DIRECTORIES, so without worktreePaths both files appear
+    assert.ok(allFiles.length >= 2, 'should find files in both main and worktree dirs without exclusion');
+
+    // With worktreePaths, the worktree directory should be excluded
+    const worktreePath = path.join(directory, '.worktrees', 'fix-issue-10');
+    const excludedFiles = await runtime.listSourceFiles(directory, undefined, undefined, [worktreePath]);
+    const paths = excludedFiles.map(f => f.relativePath);
+    assert.deepEqual(paths, ['src/main.ts'], 'should exclude worktree directory files');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('resolveRepositoryContext includes worktreePaths from git', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'formsy-opencode-'));
+  // Initialize a git repo so resolveRepositoryContext works
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+  await execFileAsync('git', ['init'], { cwd: directory });
+  await execFileAsync('git', ['config', 'user.email', 'test@test.com'], { cwd: directory });
+  await execFileAsync('git', ['config', 'user.name', 'Test'], { cwd: directory });
+
+  try {
+    const runtime = new OpenCodeRuntime();
+    const context = await runtime.resolveRepositoryContext(directory);
+
+    assert.equal(typeof context.repoId, 'string');
+    assert.ok(context.repoId.length > 0);
+    // No worktrees in a fresh repo, so worktreePaths should be empty
+    assert.ok(Array.isArray(context.worktreePaths));
+    assert.equal(context.worktreePaths.length, 0);
+  } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
