@@ -8,11 +8,13 @@ This package adds current Formsy context tools for OpenCode:
 
 - `context_search` queries the Formsy repository context index through `/api/v1/query`
 - `context_read` reads indexed source content by path through `/api/v1/read`
-- `formsy_compile_repo` scans the current repository, skips tests, and submits source files to `/api/v1/compile`
+- `formsy_compile_repo` scans the current repository and submits source files to `/api/v1/compile`
 
 It also registers OpenCode lifecycle hooks for Formsy observability. The reporter submits task-level counters, hashed file paths, server correlation IDs, and redacted command/task summaries. It does not submit prompts, source content, diffs, or shell output.
 
 ## Installation
+
+### From npm (recommended)
 
 ```bash
 npm install @formsy/plugin-opencode
@@ -27,10 +29,32 @@ Add it to `opencode.json`:
 }
 ```
 
-For local development, run this from the project where you launch OpenCode:
+### From GitHub Releases
+
+Each [release](https://github.com/Morboz/formsy-plugins/releases) includes a pre-bundled `plugin-opencode.js` that only depends on the `@opencode-ai/plugin` API (provided by OpenCode itself — no npm install required).
+
+1. Download `plugin-opencode.js` from the latest release.
+2. Place it in your project's `.opencode/plugins/` directory.
+3. Reference the local file in `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [".opencode/plugins/plugin-opencode.js"]
+}
+```
+
+### Local Development
+
+Build from source and symlink into your project:
 
 ```bash
-npm --prefix /Users/xx/software/wanggen/plugins run build --workspace @formsy/plugin-opencode && mkdir -p .opencode/plugins && ln -sf /Users/xx/software/wanggen/plugins/packages/plugin-opencode/dist/index.js .opencode/plugins/formsy-opencode.js
+# From the plugins monorepo
+npm run build --workspace @formsy/plugin-opencode
+
+# From your OpenCode project
+mkdir -p .opencode/plugins
+ln -sf /path/to/plugins/packages/plugin-opencode/dist/index.js .opencode/plugins/plugin-opencode.js
 ```
 
 ## Configuration
@@ -70,6 +94,7 @@ If observability submission fails, reports are written as JSONL under the spool 
 export FORMSY_GATEWAY_URL=http://localhost:8000
 export FORMSY_API_KEY=fsy_test_key_dev_only_12345678
 export FORMSY_MEMORY_SEARCH_ENDPOINT=/api/v1/query
+export FORMSY_REQUEST_TIMEOUT_S=300
 
 export FORMSY_OBSERVABILITY_ENABLED=true
 export FORMSY_OBSERVABILITY_URL=http://127.0.0.1:8000
@@ -122,7 +147,7 @@ Defaults:
 
 - `repo_id` prefers `git remote.origin.url`, then falls back to the local repo name
 - `revision` prefers `git rev-parse HEAD`
-- source scanning skips test files and common directories such as `node_modules`, `dist`, `build`, `.git`, `.claude`, `.worktrees`
+- source scanning skips dependency, build, and cache directories (`node_modules`, `dist`, `build`, `.git`, `.claude`, `.worktrees`, `vendor`, `venv`, etc.) and files larger than 1 MB
 - git worktree directories are dynamically detected and excluded to prevent duplicate compilation
 
 ## Build And Test

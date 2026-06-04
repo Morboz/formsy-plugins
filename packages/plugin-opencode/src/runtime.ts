@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
-import { readdir, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
+import { readdirSync, realpathSync, statSync, type Dirent } from 'node:fs';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -12,36 +13,83 @@ const COMPILE_STATUS_PATH = '/api/v1/compile/status';
 const SEARCH_PATH = '/api/v1/query';
 const READ_PATH = '/api/v1/read';
 
+/**
+ * Directories excluded from scanning — mirrors codegraph's DEFAULT_IGNORE_DIRS.
+ * Dependency / build / cache / tooling output across supported languages.
+ * Test directories (test, tests, spec, specs, __tests__) are NOT excluded.
+ */
 const IGNORED_DIRECTORIES = new Set([
-  '.cache',
-  '.claude',
-  '.git',
-  '.next',
-  '.turbo',
-  '.worktrees',
-  'build',
-  'coverage',
-  'dist',
-  'node_modules',
+  // JS / TS — dependency directories
+  'node_modules', 'bower_components', 'jspm_packages', 'web_modules',
+  '.yarn', '.pnpm-store',
+  // JS / TS — framework & bundler build / cache / deploy output
+  '.next', '.nuxt', '.svelte-kit', '.turbo', '.vite', '.parcel-cache', '.angular',
+  '.docusaurus', 'storybook-static', '.vinxi', '.nitro', 'out-tsc',
+  '.vercel', '.netlify', '.wrangler',
+  // Build output (common across ecosystems)
+  'dist', 'build', 'out', '.output',
+  // Test / coverage output (NOT test source dirs)
+  'coverage', '.nyc_output',
+  // Python
+  '__pycache__', '__pypackages__', '.venv', 'venv', '.pixi', '.pdm-build',
+  '.mypy_cache', '.pytest_cache', '.ruff_cache', '.tox', '.nox', '.hypothesis',
+  '.ipynb_checkpoints', '.eggs',
+  // Rust / JVM (Maven, Gradle, Scala)
+  'target', '.gradle',
+  // .NET
+  'obj',
+  // Vendored deps (Go, PHP/Composer, Ruby/Bundler)
+  'vendor',
+  // Swift / iOS
+  '.build', 'Pods', 'Carthage', 'DerivedData', '.swiftpm',
+  // Dart / Flutter
+  '.dart_tool', '.pub-cache',
+  // Native (Android NDK, C/C++ deps)
+  '.cxx', '.externalNativeBuild', 'vcpkg_installed',
+  // Scala tooling
+  '.bloop', '.metals',
+  // Lua / Luau (LuaRocks)
+  'lua_modules', '.luarocks',
+  // Delphi / RAD Studio IDE backups
+  '__history', '__recovery',
+  // Generic cache / tooling
+  '.cache', '.claude', '.worktrees', '.codegraph',
 ]);
 
+/**
+ * Max file size (1MB) — skip larger files to avoid OOM on generated/minified blobs.
+ */
+const MAX_FILE_SIZE = 1024 * 1024;
+
+/** Source extensions matching codegraph's EXTENSION_MAP. */
 const SOURCE_EXTENSIONS = new Set([
-  '.c',
-  '.cc',
-  '.cpp',
+  '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.hxx',
+  '.cs',
+  '.dart',
   '.go',
-  '.h',
-  '.hpp',
   '.java',
-  '.js',
-  '.jsx',
-  '.py',
+  '.js', '.mjs', '.cjs', '.xsjs', '.xsjslib', '.jsx',
+  '.kt', '.kts',
+  '.lua', '.luau',
+  '.m', '.mm',
+  '.pas', '.dpr', '.dpk', '.lpr', '.dfm', '.fmx',
+  '.php', '.module', '.install', '.theme', '.inc',
+  '.py', '.pyw',
+  '.rb', '.rake',
   '.rs',
-  '.ts',
-  '.tsx',
+  '.sc', '.scala',
+  '.swift',
+  '.ts', '.tsx', '.mts', '.cts',
+  '.vue', '.svelte',
+  '.liquid', '.twig',
+  '.yml', '.yaml', '.xml', '.properties',
 ]);
 
-const TEST_SEGMENTS = new Set(['__tests__', 'spec', 'specs', 'test', 'tests']);
+
+function normalizePath(p: string): string {
+  return p.split(path.sep).join('/');
+}
+
 const REMOTE_REPO_PATTERNS = [
   /github\.com[:/](?<owner>[^/]+)\/(?<repo>[^/.]+)(?:\.git)?$/i,
   /gitlab\.com[:/](?<owner>[^/]+)\/(?<repo>[^/.]+)(?:\.git)?$/i,
@@ -485,104 +533,213 @@ export class OpenCodeRuntime {
 
   async listSourceFiles(directory: string, include?: string[], query?: string, worktreePaths?: string[]): Promise<SourceFile[]> {
     const resolvedWorktreePaths = worktreePaths ?? await this.listWorktreeDirectories(directory);
-    const files: SourceFile[] = [];
-    await this.walkDirectory(directory, directory, files, include, resolvedWorktreePaths);
+
+    // Fast path: use git ls-files (respects .gitignore at all levels)
+    const gitFiles = this.getGitSourceFiles(directory);
+    let sourceFiles: SourceFile[];
+    if (gitFiles) {
+      const worktreeSet = new Set(resolvedWorktreePaths.map(p => path.resolve(p)));
+      sourceFiles = gitFiles
+        .filter(filePath => this.isSourceFile(filePath))
+        .map(relativePath => ({
+          absolutePath: path.resolve(directory, relativePath),
+          relativePath: relativePath.split(path.sep).join('/'),
+        }))
+        .filter(file => !this.isInWorktree(file.absolutePath, worktreeSet));
+    } else {
+      // Fallback: filesystem walk for non-git projects
+      sourceFiles = [];
+      await this.scanDirectoryWalk(directory, directory, sourceFiles, include, resolvedWorktreePaths);
+    }
+
+    // Include filtering
+    if (include && include.length > 0) {
+      sourceFiles = sourceFiles.filter(f => include.some(item => f.relativePath.includes(item)));
+    }
+
+    // Sort
     if (query) {
       const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-      files.sort((left, right) => {
+      sourceFiles.sort((left, right) => {
         const leftScore = this.queryScore(left.relativePath, terms);
         const rightScore = this.queryScore(right.relativePath, terms);
         if (leftScore !== rightScore) return rightScore - leftScore;
         return left.relativePath.localeCompare(right.relativePath);
       });
     } else {
-      files.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+      sourceFiles.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
     }
-    return files;
+    return sourceFiles;
   }
 
-  private async walkDirectory(
+  /**
+   * Get all source files visible to git (tracked + untracked but not ignored).
+   * Respects .gitignore at all levels. Returns null for non-git projects.
+   */
+  private getGitSourceFiles(rootDir: string): string[] | null {
+    try {
+      // Check if project is ignored by a parent git repo
+      const gitRoot = execFileSync(
+        'git', ['rev-parse', '--show-toplevel'],
+        { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+      ).trim();
+
+      if (path.resolve(gitRoot) !== path.resolve(rootDir)) {
+        try {
+          execFileSync(
+            'git', ['check-ignore', '-q', path.resolve(rootDir)],
+            { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+          );
+          return null; // directory is gitignored by parent
+        } catch {
+          // Not ignored — safe to proceed
+        }
+      }
+
+      // Tracked files (--recurse-submodules includes submodule files)
+      const tracked = execFileSync(
+        'git', ['ls-files', '-z', '-c', '--recurse-submodules'],
+        { cwd: rootDir, encoding: 'utf-8', timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+      );
+
+      // Untracked files
+      const untracked = execFileSync(
+        'git', ['ls-files', '-z', '-o', '--exclude-standard'],
+        { cwd: rootDir, encoding: 'utf-8', timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+      );
+
+      const files: string[] = [];
+      for (const rel of tracked.split('\0')) {
+        if (rel && !IGNORED_DIRECTORIES.has(rel.split('/')[0])) {
+          files.push(rel);
+        }
+      }
+      for (const rel of untracked.split('\0')) {
+        if (rel && !rel.endsWith('/') && !IGNORED_DIRECTORIES.has(rel.split('/')[0])) {
+          files.push(rel);
+        }
+      }
+      return files;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Filesystem walk fallback for non-git projects.
+   * Filters by IGNORED_DIRECTORIES and SOURCE_EXTENSIONS. Skips symlink cycles.
+   */
+  private async scanDirectoryWalk(
     rootDirectory: string,
     currentDirectory: string,
     files: SourceFile[],
     include?: string[],
     worktreePaths?: string[]
   ): Promise<void> {
-    const entries = await readdir(currentDirectory, { withFileTypes: true });
+    const worktreeSet = new Set((worktreePaths ?? []).map(p => path.resolve(p)));
+    const visitedDirs = new Set<string>();
 
-    for (const entry of entries) {
-      const absolutePath = path.join(currentDirectory, entry.name);
-      const relativePath = path.relative(rootDirectory, absolutePath);
+    const walk = async (dir: string): Promise<void> => {
+      // Resolve and detect symlink cycles
+      let realDir: string;
+      try {
+        realDir = realpathSync(dir);
+      } catch {
+        return; // unresolvable directory
+      }
+      if (visitedDirs.has(realDir)) return;
+      visitedDirs.add(realDir);
 
-      if (entry.isDirectory()) {
-        if (IGNORED_DIRECTORIES.has(entry.name) || TEST_SEGMENTS.has(entry.name)) {
+      let entries: Dirent[];
+      try {
+        entries = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return; // unreadable directory
+      }
+
+      for (const entry of entries) {
+        // Always skip git internals and our own data directory
+        if (entry.name === '.git' || entry.name === '.codegraph') continue;
+
+        const absolutePath = path.join(dir, entry.name);
+        const relativePath = normalizePath(path.relative(rootDirectory, absolutePath));
+
+        if (entry.isSymbolicLink()) {
+          try {
+            const realTarget = realpathSync(absolutePath);
+            const st = statSync(realTarget);
+            if (st.isDirectory()) {
+              if (!IGNORED_DIRECTORIES.has(entry.name)) {
+                await walk(absolutePath);
+              }
+            } else if (st.isFile() && st.size <= MAX_FILE_SIZE && this.isSourceFile(relativePath)) {
+              if (!this.isInWorktree(absolutePath, worktreeSet)) {
+                files.push({ absolutePath, relativePath });
+              }
+            }
+          } catch {
+            // broken symlink — skip
+          }
           continue;
         }
-        // Skip git worktree directories to avoid compiling duplicate source files
-        if (worktreePaths && worktreePaths.some(wt => {
-          const resolved = path.resolve(absolutePath);
-          return resolved === wt || resolved.startsWith(wt + path.sep);
-        })) {
-          continue;
+
+        if (entry.isDirectory()) {
+          if (IGNORED_DIRECTORIES.has(entry.name)) continue;
+          if (!this.isInWorktree(absolutePath, worktreeSet)) {
+            await walk(absolutePath);
+          }
+        } else if (entry.isFile()) {
+          if (!this.isSourceFile(relativePath)) continue;
+          try {
+            const st = statSync(absolutePath);
+            if (st.size > MAX_FILE_SIZE) continue;
+          } catch {
+            continue;
+          }
+          if (!this.isInWorktree(absolutePath, worktreeSet)) {
+            files.push({ absolutePath, relativePath });
+          }
         }
-        await this.walkDirectory(rootDirectory, absolutePath, files, include, worktreePaths);
-        continue;
       }
+    };
 
-      if (!entry.isFile()) {
-        continue;
-      }
+    await walk(currentDirectory);
+  }
 
-      if (!this.isSourceFile(relativePath)) {
-        continue;
-      }
-
-      if (this.isTestFile(relativePath)) {
-        continue;
-      }
-
-      if (include && include.length > 0 && !include.some((item) => relativePath.includes(item))) {
-        continue;
-      }
-
-      files.push({
-        absolutePath,
-        relativePath: relativePath.split(path.sep).join('/'),
-      });
+  private isInWorktree(absolutePath: string, worktreeSet: Set<string>): boolean {
+    if (worktreeSet.size === 0) return false;
+    const resolved = path.resolve(absolutePath);
+    for (const wt of worktreeSet) {
+      if (resolved === wt || resolved.startsWith(wt + path.sep)) return true;
     }
+    return false;
   }
 
   private isSourceFile(relativePath: string): boolean {
-    return SOURCE_EXTENSIONS.has(path.extname(relativePath).toLowerCase());
-  }
-
-  private isTestFile(relativePath: string): boolean {
-    const normalized = relativePath.split(path.sep).join('/');
-    const segments = normalized.split('/');
-    if (segments.some((segment) => TEST_SEGMENTS.has(segment))) {
-      return true;
-    }
-
-    const extension = path.extname(normalized);
-    const basename = path.basename(normalized, extension).toLowerCase();
-    return (
-      basename.includes('.test') ||
-      basename.includes('.spec') ||
-      basename.endsWith('_test') ||
-      basename.endsWith('_spec')
-    );
+    const ext = path.extname(relativePath).toLowerCase();
+    if (SOURCE_EXTENSIONS.has(ext)) return true;
+    // Play Framework routes: extensionless `conf/routes`
+    if (relativePath === 'conf/routes' || relativePath.endsWith('/conf/routes') || relativePath.endsWith('.routes')) return true;
+    return false;
   }
 
   private detectLanguage(filePath: string): string {
-    const extension = path.extname(filePath).toLowerCase();
-    switch (extension) {
+    const ext = path.extname(filePath).toLowerCase();
+    switch (ext) {
       case '.ts':
       case '.tsx':
+      case '.mts':
+      case '.cts':
         return 'typescript';
       case '.js':
       case '.jsx':
+      case '.mjs':
+      case '.cjs':
+      case '.xsjs':
+      case '.xsjslib':
         return 'javascript';
       case '.py':
+      case '.pyw':
         return 'python';
       case '.java':
         return 'java';
@@ -593,9 +750,56 @@ export class OpenCodeRuntime {
       case '.c':
       case '.cc':
       case '.cpp':
+      case '.cxx':
       case '.h':
       case '.hpp':
+      case '.hxx':
         return 'cpp';
+      case '.cs':
+        return 'csharp';
+      case '.php':
+      case '.module':
+      case '.install':
+      case '.theme':
+      case '.inc':
+        return 'php';
+      case '.rb':
+      case '.rake':
+        return 'ruby';
+      case '.swift':
+        return 'swift';
+      case '.kt':
+      case '.kts':
+        return 'kotlin';
+      case '.dart':
+        return 'dart';
+      case '.sc':
+      case '.scala':
+        return 'scala';
+      case '.lua':
+      case '.luau':
+        return 'lua';
+      case '.m':
+      case '.mm':
+        return 'objc';
+      case '.vue':
+        return 'vue';
+      case '.svelte':
+        return 'svelte';
+      case '.pas':
+      case '.dpr':
+      case '.dpk':
+      case '.lpr':
+      case '.dfm':
+      case '.fmx':
+        return 'pascal';
+      case '.liquid':
+      case '.twig':
+      case '.yml':
+      case '.yaml':
+      case '.xml':
+      case '.properties':
+        return 'text';
       default:
         return 'text';
     }

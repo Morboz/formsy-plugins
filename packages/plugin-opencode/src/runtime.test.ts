@@ -115,7 +115,7 @@ test('normalizeRepoId converts git remotes to provider slugs', () => {
   assert.equal(normalizeRepoId(undefined, '/tmp/custom', '/tmp/custom'), 'custom');
 });
 
-test('compileRepository submits all source files in one replace request', async () => {
+test('compileRepository submits all source files (including test files) in one replace request', async () => {
   const calls: Array<{ url: string; body: { files: Array<{ path: string; content: string }> } }> = [];
   const originalFetch = globalThis.fetch;
   process.env.FORMSY_GATEWAY_URL = 'http://formsy.test';
@@ -132,7 +132,7 @@ test('compileRepository submits all source files in one replace request', async 
     await mkdir(path.join(directory, 'src'));
     await writeFile(path.join(directory, 'src', 'a.ts'), 'export const a = 1;\n');
     await writeFile(path.join(directory, 'src', 'b.ts'), 'export const b = 2;\n');
-    await writeFile(path.join(directory, 'src', 'a.test.ts'), 'test("skip", () => undefined);\n');
+    await writeFile(path.join(directory, 'src', 'a.test.ts'), 'describe("a", () => { it("works", () => {}); });\n');
 
     const runtime = new OpenCodeRuntime();
     const result = await runtime.compileRepository({
@@ -144,9 +144,9 @@ test('compileRepository submits all source files in one replace request', async 
 
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, 'http://formsy.test/api/v1/compile');
-    assert.deepEqual(calls[0].body.files.map((file) => file.path), ['src/a.ts', 'src/b.ts']);
-    assert.equal(calls[0].body.files[0].content, 'export const a = 1;\n');
-    assert.equal(result.compiledFiles.length, 2);
+    assert.deepEqual(calls[0].body.files.map((file) => file.path), ['src/a.test.ts', 'src/a.ts', 'src/b.ts']);
+    assert.equal(calls[0].body.files[0].content, 'describe("a", () => { it("works", () => {}); });\n');
+    assert.equal(result.compiledFiles.length, 3);
     assert.deepEqual(result.failures, []);
   } finally {
     globalThis.fetch = originalFetch;
