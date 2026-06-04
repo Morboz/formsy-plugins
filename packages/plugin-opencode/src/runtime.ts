@@ -610,16 +610,26 @@ export class OpenCodeRuntime {
     }
 
     let response: Response;
+    const timeoutMs = (Number(process.env.FORMSY_REQUEST_TIMEOUT_S) || 300) * 1000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       response = await fetch(upstreamUrl, {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : 'Failed to reach gateway service';
+        error instanceof DOMException && error.name === 'AbortError'
+          ? `Gateway request timed out after ${timeoutMs / 1000}s`
+          : error instanceof Error
+            ? error.message
+            : 'Failed to reach gateway service';
       throw new Error(`Gateway request failed: ${message}`);
+    } finally {
+      clearTimeout(timer);
     }
 
     let data: unknown;

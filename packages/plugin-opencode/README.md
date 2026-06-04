@@ -42,6 +42,7 @@ FORMSY_GATEWAY_URL=http://localhost:3001
 FORMSY_API_KEY=fsy_test_key_dev_only_12345678
 FORMSY_MEMORY_SEARCH_ENDPOINT=/api/v1/query
 FORMSY_TIMEOUT_S=120
+FORMSY_REQUEST_TIMEOUT_S=300
 ```
 
 | Variable | Default | Description |
@@ -50,6 +51,7 @@ FORMSY_TIMEOUT_S=120
 | `FORMSY_API_KEY` | — | Bearer token for gateway authentication |
 | `FORMSY_MEMORY_SEARCH_ENDPOINT` | `/api/v1/query` | Search endpoint path (must start with `/`) |
 | `FORMSY_TIMEOUT_S` | `120` | Server-side query timeout budget (seconds). The plugin sends `query_timeout_s` and `fanout_timeout_s` hints to the gateway, computed as `min(timeoutS − 10, 90)`. Increase this if context searches on large repos time out on the server side. |
+| `FORMSY_REQUEST_TIMEOUT_S` | `300` | Client-side HTTP request timeout (seconds). Applies to all gateway requests including compile, query, read, and compile/status. Increase this for large repos where compilation takes longer. |
 
 Observability:
 
