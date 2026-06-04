@@ -189,6 +189,12 @@ export class OpenCodeRuntime {
   private explorationClosed: boolean;
   private acceptedTargets: string[];
 
+  /** Track in-progress compiles keyed by `${repoId}:${revision}` to prevent
+   *  concurrent compile requests for the same repository, which can cause
+   *  write conflicts on the server.  The promise resolves to the same boolean
+   *  that ensureMemoryCompiled would return. */
+  private compileInProgress: Map<string, Promise<boolean>>;
+
   constructor() {
     this.gatewayUrl =
       process.env.FORMSY_GATEWAY_URL ||
@@ -202,6 +208,7 @@ export class OpenCodeRuntime {
     this.groundedFiles = [];
     this.explorationClosed = false;
     this.acceptedTargets = [];
+    this.compileInProgress = new Map();
   }
 
   async resolveRepositoryContext(
@@ -737,7 +744,84 @@ export class OpenCodeRuntime {
       return true;
     }
 
-    // Need to compile: collect files and submit
+    // ── Concurrency guard ──────────────────────────────────────────────
+    // Serialize compiles for the same repo+revision by chaining
+    // each new request onto the tail of the in-flight promise, so
+    // concurrent calls never submit overlapping compile requests.
+    const lockKey = `${repoId}:${revision}`;
+    const existing = this.compileInProgress.get(lockKey);
+
+    const compilePromise: Promise<boolean> = existing
+      ? existing.then(async () => {
+          // Re-check after the prior compile finishes — it may have
+          // satisfied our query.
+          if (this.compiledIdentitySatisfies(repoId, revision, querySignature)) {
+            return true;
+          }
+          // Re-check server status — the prior compile may have
+          // uploaded a broader compile that covers our query.
+          const serverStatus = await this.compileStatus(repoId, revision, sessionId);
+          if (serverStatus && this.existingCompileSatisfiesQuery(serverStatus, query)) {
+            this.compiledIdentity = this.compiledIdentityFromStatus(
+              serverStatus,
+              repoId,
+              revision,
+              querySignature,
+            );
+            const statusRevision =
+              typeof serverStatus.revision === 'string' && serverStatus.revision.trim()
+                ? serverStatus.revision.trim()
+                : revision;
+            this.compileRevision = statusRevision || revision;
+            return true;
+          }
+          // Compile is still needed — run it now.
+          return this._doCompile({
+            repoId,
+            revision,
+            query,
+            querySignature,
+            directory,
+            worktreePaths,
+            sessionId,
+          });
+        })
+      : this._doCompile({
+          repoId,
+          revision,
+          query,
+          querySignature,
+          directory,
+          worktreePaths,
+          sessionId,
+        });
+
+    this.compileInProgress.set(lockKey, compilePromise);
+
+    try {
+      return await compilePromise;
+    } finally {
+      // Only remove the sentinel if it still points to this promise —
+      // a chained promise may have replaced us.
+      if (this.compileInProgress.get(lockKey) === compilePromise) {
+        this.compileInProgress.delete(lockKey);
+      }
+    }
+  }
+
+  /** Execute the actual compile request.  Extracted so concurrency
+   *  guard in ensureMemoryCompiled can hold a promise for the result. */
+  private async _doCompile(options: {
+    repoId: string;
+    revision: string;
+    query: string;
+    querySignature: string;
+    sessionId?: string;
+    directory: string;
+    worktreePaths?: string[];
+  }): Promise<boolean> {
+    const { repoId, revision, query, querySignature, sessionId, directory, worktreePaths } = options;
+
     const sourceFiles = await this.listSourceFiles(directory, undefined, query, worktreePaths);
     const files: CompileRequestBody['files'] = [];
 
