@@ -1,0 +1,59 @@
+name: Release plugin-opencode
+
+on:
+  push:
+    tags:
+      - 'plugin-opencode@*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build plugin
+        run: pnpm run build --workspace @formsy/plugin-opencode
+
+      - name: Bundle for distribution
+        run: |
+          npx esbuild packages/plugin-opencode/dist/index.js \
+            --bundle \
+            --platform=node \
+            --target=node20 \
+            --format=esm \
+            --external:@opencode-ai/plugin \
+            --outfile=plugin-opencode.js \
+            --banner:js='// @formsy/plugin-opencode — Formsy context plugin for OpenCode'
+
+      - name: Verify bundle
+        run: |
+          echo "Bundle size: $(wc -c < plugin-opencode.js) bytes"
+          head -3 plugin-opencode.js
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: plugin-opencode.js
+          generate_release_notes: true
+          fail_on_unmatched_files: true
