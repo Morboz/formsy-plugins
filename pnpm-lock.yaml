@@ -49,12 +49,6 @@ importers:
 
   packages/plugin-opencode:
     dependencies:
-      '@formsy/plugin-core':
-        specifier: workspace:*
-        version: link:../plugin-core
-      '@formsy/sdk-core':
-        specifier: workspace:*
-        version: link:../sdk-core
       '@opencode-ai/plugin':
         specifier: ^1.14.19
         version: 1.14.19
