@@ -31,7 +31,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build plugin
-        run: pnpm run build --workspace @formsy/plugin-opencode
+        run: pnpm run build --filter @formsy/plugin-opencode
 
       - name: Bundle for distribution
         run: |
