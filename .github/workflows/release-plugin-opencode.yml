@@ -44,14 +44,23 @@ jobs:
             --outfile=plugin-opencode.js \
             --banner:js='// @formsy/plugin-opencode — Formsy context plugin for OpenCode'
 
+      - name: Stage skill for release
+        run: |
+          mkdir -p skills/formsy-context
+          cp packages/plugin-opencode/.opencode/skills/formsy-context/SKILL.md skills/formsy-context/SKILL.md
+
       - name: Verify bundle
         run: |
           echo "Bundle size: $(wc -c < plugin-opencode.js) bytes"
           head -3 plugin-opencode.js
+          echo "Skill files:"
+          find skills -type f
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: plugin-opencode.js
+          files: |
+            plugin-opencode.js
+            skills/formsy-context/SKILL.md
           generate_release_notes: true
           fail_on_unmatched_files: true
