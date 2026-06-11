@@ -46,6 +46,7 @@ jobs:
 
       - name: Stage skill for release
         run: |
+          mkdir -p skills
           cp -r packages/plugin-opencode/.opencode/skills/formsy-context skills/formsy-context
           tar -czf skills-formsy-context.tar.gz -C skills formsy-context
 
