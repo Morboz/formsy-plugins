@@ -60,6 +60,16 @@ export FORMSY_OBSERVABILITY_TIMEOUT_MS=2000
 - `end_line` optional positive integer
 - `identity` optional object
 
+## Local Development
+
+Build and install from source (overwrites release-installed files):
+
+```bash
+# From the plugins monorepo root
+pnpm run build --filter @formsy/plugin-opencode && \
+  cp packages/plugin-opencode/dist/index.js ~/.config/opencode/plugins/plugin-opencode.js
+```
+
 ## Build & Test
 
 ```bash

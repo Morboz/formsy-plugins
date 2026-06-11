@@ -1,6 +1,7 @@
 import { tool, type Plugin } from '@opencode-ai/plugin';
 import { FormsyObservationReporter } from './observability.js';
 import { OpenCodeRuntime } from './runtime.js';
+import { formsyStatusesFromToolResult } from './formsy-status.js';
 
 const PLUGIN_MARKER = 'formsy-opencode-plugin@context-v2';
 
@@ -60,6 +61,24 @@ export const FormsyOpenCodePlugin: Plugin = async ({ directory, client }) => {
           output: output.output,
         },
       });
+
+      // Inject formsy_statuses into metadata if not already present.
+      // The runtime.ts contextSearch() already adds these for context_search,
+      // but this hook covers other tools and acts as a fallback.
+      const existingMetadata = (output.metadata ?? {}) as Record<string, unknown>;
+      if (!Array.isArray(existingMetadata.formsy_statuses)) {
+        const outputText = typeof output.output === 'string' ? output.output : '';
+        const statuses = formsyStatusesFromToolResult(
+          input.tool,
+          objectArgs(input.args),
+          outputText,
+        );
+        if (statuses.length > 0) {
+          existingMetadata.formsy_statuses = statuses;
+          output.metadata = existingMetadata;
+        }
+      }
+
       await observability.flush(input.sessionID, 'partial', 'running');
     },
     tool: {

@@ -478,6 +478,9 @@ export class OpenCodeRuntime {
     const bundlePrimaryFiles = this.extractBundlePrimaryFiles(outputData.bundle);
     const bundleMustEdit = this.extractBundleMustEdit(outputData.bundle);
 
+    // Build FormSy statuses for TUI sidebar consumption
+    const formsyStatuses = this.buildContextSearchStatuses(outputData, options.query, directMatchFiles, bundlePrimaryFiles);
+
     return {
       output: this.searchOutput(outputData),
       metadata: {
@@ -487,6 +490,7 @@ export class OpenCodeRuntime {
         directMatchFiles,
         bundlePrimaryFiles,
         bundleMustEdit,
+        formsy_statuses: formsyStatuses,
         ...this.correlationMetadata(data),
       },
     };
@@ -1311,5 +1315,111 @@ export class OpenCodeRuntime {
       }
     }
     return metadata;
+  }
+
+  /**
+   * Build FormSy status entries for the TUI sidebar.
+   * These are injected into tool result metadata as `formsy_statuses`
+   * so the sidebar plugin can render them.
+   */
+  private buildContextSearchStatuses(
+    data: Record<string, unknown>,
+    query: string,
+    directMatchFiles: string[],
+    bundlePrimaryFiles: string[],
+  ): Array<{ kind: string; text: string }> {
+    const statuses: Array<{ kind: string; text: string }> = [];
+
+    // Top-level fields from server response
+    const ok = data.ok;
+    const topLevelCoverage = typeof data.coverage === 'string' ? data.coverage : '';
+    const acceptedTargets = this.coerceStringList(data.accepted_targets);
+    const explorationClosed = data.exploration_closed === true || data.exploration_closed === 'true';
+
+    // Bundle-level fields
+    const bundle = typeof data.bundle === 'object' && data.bundle !== null
+      ? data.bundle as Record<string, unknown>
+      : {};
+    const bundleOk = bundle.ok;
+    const bundleCoverage = typeof bundle.coverage === 'string' ? bundle.coverage : '';
+    const bundleConfidence = typeof bundle.confidence === 'number' ? bundle.confidence : undefined;
+    const rootCause = typeof bundle.root_cause_hypothesis === 'object' && bundle.root_cause_hypothesis !== null
+      ? bundle.root_cause_hypothesis as Record<string, unknown>
+      : undefined;
+    const primarySymbol = rootCause && typeof rootCause.primary_symbol === 'string'
+      ? rootCause.primary_symbol
+      : undefined;
+    const primaryFile = rootCause && typeof rootCause.primary_file === 'string'
+      ? rootCause.primary_file
+      : undefined;
+
+    // Guidance-level fields
+    const guidance = typeof data.guidance === 'object' && data.guidance !== null
+      ? data.guidance as Record<string, unknown>
+      : undefined;
+    const canPatchNow = guidance?.can_patch_now === true;
+    const groundingConfidence = guidance && typeof guidance.grounding_confidence === 'string'
+      ? guidance.grounding_confidence
+      : undefined;
+
+    // Failed retrieval
+    if (ok === false && bundleOk !== true) {
+      const error = typeof data.error === 'string' ? data.error : 'Search failed';
+      statuses.push({
+        kind: 'formsy.context_ready',
+        text: `[FormSy] Context search failed\n${error}`,
+      });
+      return statuses;
+    }
+
+    // Determine effective coverage
+    const effectiveCoverage = bundleCoverage || topLevelCoverage;
+    const isPoorCoverage = ['poor', 'missing', 'none', 'empty'].includes(effectiveCoverage.toLowerCase());
+
+    // Build context_ready status
+    const detailParts: string[] = [];
+    if (query) detailParts.push(`query: "${query.substring(0, 50)}${query.length > 50 ? '...' : ''}"`);
+    if (directMatchFiles.length) detailParts.push(`direct: ${directMatchFiles.length} file${directMatchFiles.length > 1 ? 's' : ''}`);
+    if (bundlePrimaryFiles.length) detailParts.push(`bundle: ${bundlePrimaryFiles.length} primary`);
+    if (primarySymbol) detailParts.push(`symbol: ${primarySymbol}`);
+    if (bundleConfidence !== undefined) detailParts.push(`confidence: ${(bundleConfidence * 100).toFixed(0)}%`);
+    if (groundingConfidence) detailParts.push(`grounding: ${groundingConfidence}`);
+
+    const coverageEmoji = isPoorCoverage ? '⚠' : effectiveCoverage ? '✓' : '';
+    const coverageLabel = effectiveCoverage || 'unknown';
+
+    statuses.push({
+      kind: 'formsy.context_ready',
+      text: `[FormSy] Context Pack ready${coverageEmoji ? ` ${coverageEmoji} ${coverageLabel}` : ''}\n${detailParts.join(' | ')}`,
+    });
+
+    // Verified recipe — if we have accepted targets
+    if (acceptedTargets.length > 0) {
+      statuses.push({
+        kind: 'formsy.verified_recipe',
+        text: `[FormSy] Verified Recipe\n${acceptedTargets.slice(0, 5).join(', ')}${acceptedTargets.length > 5 ? ` +${acceptedTargets.length - 5} more` : ''}`,
+      });
+    } else if (primaryFile && canPatchNow) {
+      // Even without explicit accepted_targets, if guidance says can_patch_now
+      statuses.push({
+        kind: 'formsy.verified_recipe',
+        text: `[FormSy] Ready to patch\n${primaryFile}`,
+      });
+    }
+
+    // Finish gate
+    if (explorationClosed) {
+      statuses.push({
+        kind: 'formsy.finish_gate',
+        text: `[FormSy] Finish Gate ✓ — Exploration closed, ready to proceed`,
+      });
+    } else if (canPatchNow && isPoorCoverage === false) {
+      statuses.push({
+        kind: 'formsy.finish_gate',
+        text: `[FormSy] Finish Gate ✓ — Sufficient context to proceed`,
+      });
+    }
+
+    return statuses;
   }
 }
