@@ -46,21 +46,21 @@ jobs:
 
       - name: Stage skill for release
         run: |
-          mkdir -p skills/formsy-context
-          cp packages/plugin-opencode/.opencode/skills/formsy-context/SKILL.md skills/formsy-context/SKILL.md
+          cp -r packages/plugin-opencode/.opencode/skills/formsy-context skills/formsy-context
+          tar -czf skills-formsy-context.tar.gz -C skills formsy-context
 
       - name: Verify bundle
         run: |
           echo "Bundle size: $(wc -c < plugin-opencode.js) bytes"
           head -3 plugin-opencode.js
-          echo "Skill files:"
-          find skills -type f
+          echo "Skill archive contents:"
+          tar -tzf skills-formsy-context.tar.gz
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             plugin-opencode.js
-            skills/formsy-context/SKILL.md
+            skills-formsy-context.tar.gz
           generate_release_notes: true
           fail_on_unmatched_files: true

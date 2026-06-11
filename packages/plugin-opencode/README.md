@@ -13,11 +13,11 @@ Formsy native plugin for [OpenCode](https://opencode.ai).
 One command installs both the plugin and the `formsy-context` skill:
 
 ```bash
-mkdir -p ~/.config/opencode/plugins ~/.config/opencode/skills/formsy-context && \
+mkdir -p ~/.config/opencode/plugins ~/.config/opencode/skills && \
   curl -fsSL https://github.com/Morboz/formsy-plugins/releases/latest/download/plugin-opencode.js \
     -o ~/.config/opencode/plugins/plugin-opencode.js && \
-  curl -fsSL https://github.com/Morboz/formsy-plugins/releases/latest/download/skills/formsy-context/SKILL.md \
-    -o ~/.config/opencode/skills/formsy-context/SKILL.md
+  curl -fsSL https://github.com/Morboz/formsy-plugins/releases/latest/download/skills-formsy-context.tar.gz | \
+    tar -xzf - -C ~/.config/opencode/skills
 ```
 
 That's it. OpenCode automatically loads files in `~/.config/opencode/plugins/` and `~/.config/opencode/skills/` on startup.
